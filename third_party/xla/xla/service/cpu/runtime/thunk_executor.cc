@@ -16,6 +16,7 @@ limitations under the License.
 #include "xla/service/cpu/runtime/thunk_executor.h"
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -61,7 +62,7 @@ ThunkExecutor::ThunkExecutor(ThunkSequence thunk_sequence,
   }
 
   // Erase redundant edges between nodes.
-  int64_t num_erased_edges = TransitiveReduction();
+  int64_t num_erased_edges = RunTransitiveReductionAndUpdatePriorities();
 
   // Check if constructed execution DAG is sequential: every node depends on the
   // completion of the previous node.
@@ -122,6 +123,9 @@ absl::StatusOr<ThunkExecutor> ThunkExecutor::Create(
   return ThunkExecutor(std::move(thunk_sequence), std::move(defs), options);
 }
 
+ThunkExecutor::ExecuteState::Node::Node(const NodeDef& node_def)
+    : counter(node_def.in_edges.size()), out_edges(&node_def.out_edges) {}
+
 ThunkExecutor::ExecuteState::ExecuteState(ThunkExecutor* executor,
                                           Thunk::TaskRunner* runner)
     : executor(executor),
@@ -133,11 +137,9 @@ ThunkExecutor::ExecuteState::ExecuteState(ThunkExecutor* executor,
   DCHECK(runner == nullptr || static_cast<bool>(*runner))
       << "`runner` must be nullptr or a valid TaskRunner";
 
-  Node* node = nodes.data();
+  NodeStorage* node = nodes.data();
   for (const NodeDef& node_def : executor->nodes_defs()) {
-    node->counter.store(node_def.in_edges.size(), std::memory_order_release);
-    node->out_edges = &node_def.out_edges;
-    ++node;
+    new (node++) Node(node_def);
   }
 }
 
@@ -159,8 +161,14 @@ tsl::AsyncValueRef<ThunkExecutor::ExecuteEvent> ThunkExecutor::Execute(
 
   // Create async execution state on heap and kick-off execution.
   auto state = std::make_unique<ExecuteState>(this, params.task_runner);
-  Execute(state.get(), params, ReadyQueue(source_.begin(), source_.end()),
-          /*lock=*/params.session.Join());
+
+  if (options_.use_priority_ready_queue) {
+    Execute(state.get(), params, PriorityReadyQueue(nodes_defs_, source_),
+            /*lock=*/params.session.Join());
+  } else {
+    Execute(state.get(), params, FifoReadyQueue(source_),
+            /*lock=*/params.session.Join());
+  }
 
   // If execution already completed (all kernels executed in the caller thread),
   // immediately return the result to avoid wasteful reference counting below.
@@ -255,13 +263,14 @@ void ThunkExecutor::ResumeExecuteSequential(
   event.SetStateConcrete();
 }
 
+template <typename ReadyQueue>
 void ThunkExecutor::Execute(ExecuteState* state,
                             const Thunk::ExecuteParams& params,
                             ReadyQueue ready_queue,
                             Thunk::ExecuteSession::Lock lock) {
   tsl::profiler::TraceMe trace("ThunkExecutor::Execute");
 
-  DCHECK(!ready_queue.empty()) << "Ready queue must not be empty";
+  DCHECK(!ready_queue.Empty()) << "Ready queue must not be empty";
   DCHECK(lock) << "Execute session lock must be set";
 
   bool has_runner = state->runner != nullptr;
@@ -269,18 +278,18 @@ void ThunkExecutor::Execute(ExecuteState* state,
   // Threshold for splitting ready queue into separate thunk executor tasks.
   int64_t split_threshold = params.session.split_threshold();
 
-  for (int64_t i = 0; i < ready_queue.size(); ++i) {
-    NodeId id = ready_queue[i];
-    ExecuteState::Node& node = state->nodes[id];
+  while (!ready_queue.Empty()) {
+    NodeId id = ready_queue.Pop();
+    ExecuteState::Node& node = state->node(id);
 
     int64_t cnt = node.counter.load(std::memory_order_acquire);
     DCHECK_EQ(cnt, 0) << "Node counter must be 0";  // Crash Ok
 
     // If we have multiple ready thunks, split the ready queue and offload
     // thunks processing to the task runner.
-    int64_t num_ready_thunks = ready_queue.size() - i;
+    int64_t num_ready_thunks = ready_queue.Size();
     if (ABSL_PREDICT_FALSE(has_runner && num_ready_thunks > split_threshold)) {
-      SplitReadyQueue(state, params, /*start_index=*/i + 1, ready_queue);
+      SplitReadyQueue(state, params, ready_queue, split_threshold);
     }
 
     // Execute thunk for the given node id. If execution is aborted, we keep
@@ -306,13 +315,13 @@ void ThunkExecutor::Execute(ExecuteState* state,
       // the same execute session.
       execute_event.AndThen([&params, &node, state,
                              execute_event = execute_event.AsPtr(),
+                             ready_queue = ready_queue.CreateEmptyReadyQueue(),
                              lock = params.session.Join()]() mutable {
-        ReadyQueue ready_queue;
         state->executor->ProcessOutEdges(state, execute_event, node,
                                          ready_queue);
         // If ready queue is empty it might mean that we have completed an
         // execution and destroyed the `state`.
-        if (ABSL_PREDICT_TRUE(!ready_queue.empty())) {
+        if (ABSL_PREDICT_TRUE(!ready_queue.Empty())) {
           state->executor->Execute(state, params, std::move(ready_queue),
                                    std::move(lock));
         }
@@ -321,17 +330,17 @@ void ThunkExecutor::Execute(ExecuteState* state,
   }
 }
 
+template <typename ReadyQueue>
 inline ABSL_ATTRIBUTE_ALWAYS_INLINE void ThunkExecutor::SplitReadyQueue(
     ExecuteState* state, const Thunk::ExecuteParams& params,
-    int64_t start_index, ReadyQueue& ready_queue) {
+    ReadyQueue& ready_queue, int64_t split_threshold) {
   DCHECK(state->runner) << "TaskRunner must be set";
-  int64_t end_index = ready_queue.size();
 
   // We use recursive work splitting to push the tail of the ready queue to
   // the task runner. Recursive work splitting creates a more uniform work
   // distribution across the task runner threads and avoids a situation when
   // we have a long tail of work that is processed by a single thread.
-  while (end_index > start_index) {
+  while (ready_queue.Size() > split_threshold) {
     // Try to acquire a lock to offload ready thunks to the task runner. If
     // we can't get a lock, we will keep processing the ready queue in the
     // current thread as it means that we have enough concurrent workers
@@ -341,22 +350,16 @@ inline ABSL_ATTRIBUTE_ALWAYS_INLINE void ThunkExecutor::SplitReadyQueue(
       break;
     }
 
-    // Execute [mid_index, end_index) nodes in the task runner.
-    int64_t mid_index = (start_index + end_index) / 2;
-    (*state->runner)([&params, state,
-                      ready_queue = ReadyQueue(ready_queue.begin() + mid_index,
-                                               ready_queue.begin() + end_index),
+    // Execute half of the ready queue nodes in the task runner.
+    (*state->runner)([&params, state, ready_queue = ready_queue.PopHalf(),
                       lock = std::move(task_runner_lock)]() mutable {
       state->executor->Execute(state, params, std::move(ready_queue),
                                std::move(lock));
     });
-    end_index = mid_index;
   }
-
-  // Erase ready nodes passed to the task runner.
-  ready_queue.erase(ready_queue.begin() + end_index, ready_queue.end());
 }
 
+template <typename ReadyQueue>
 void ThunkExecutor::ProcessOutEdges(
     ExecuteState* state, tsl::AsyncValuePtr<Thunk::ExecuteEvent> node_event,
     ExecuteState::Node& node, ReadyQueue& ready_queue) {
@@ -375,11 +378,11 @@ void ThunkExecutor::ProcessOutEdges(
 
   // Append ready nodes to the back of the ready queue.
   for (NodeId out_edge : *node.out_edges) {
-    ExecuteState::Node& out_node = state->nodes[out_edge];
+    ExecuteState::Node& out_node = state->node(out_edge);
 
     int64_t cnt = out_node.counter.fetch_sub(1, std::memory_order_release);
     DCHECK_GE(cnt, 1) << "Node counter can't drop below 0";
-    if (cnt == 1) ready_queue.push_back(out_edge);
+    if (cnt == 1) ready_queue.Push(out_edge);
   }
 
   // Drop the pending sink nodes counter if the node is a sink.
@@ -430,7 +433,7 @@ static int64_t EraseEdge(ThunkExecutor::NodeDef& from,
   return 0;
 }
 
-int64_t ThunkExecutor::TransitiveReduction() {
+int64_t ThunkExecutor::RunTransitiveReductionAndUpdatePriorities() {
   int64_t num_erased_edges = 0;
 
   // Keep workspace for DFS traversal between iterations.
@@ -453,11 +456,11 @@ int64_t ThunkExecutor::TransitiveReduction() {
     stack.clear();
     visited.assign(nodes_defs_.size(), false);
 
-    // Initialize stack with nodes reachable via immediate out nodes. We don't
-    // need to add source node and immediate out nodes to the visited set
-    // because graph is acyclic and we don't visit them again.
+    // Initialize stack with nodes reachable via immediate out nodes. We mark
+    // immediate out nodes as visited to correctly compute node priority below.
     for (int64_t out_id : source_node.out_edges) {
       NodeDef& out_node = nodes_defs_[out_id];
+      visited[out_id] = true;
       for (int64_t start_id : out_node.out_edges) add_to_stack(start_id);
     }
 
@@ -471,6 +474,9 @@ int64_t ThunkExecutor::TransitiveReduction() {
 
       for (int64_t out_id : node.out_edges) add_to_stack(out_id);
     }
+
+    // Set node priority to the number of visited nodes in the DFS traversal.
+    source_node.priority = absl::c_count(visited, true);
   }
 
   return num_erased_edges;
@@ -494,14 +500,88 @@ std::string ThunkExecutor::ToString() const {
     const Thunk& thunk = *thunk_sequence_[i];
     bool is_source = absl::c_find(source_, i) != source_.end();
     bool is_sink = absl::c_find(sink_, i) != sink_.end();
-    absl::StrAppendFormat(
-        &str,
-        "\n thunk #%05d: op_name=%s, dependencies=[%s], source=%v, sink=%v", i,
-        thunk.info().op_name, absl::StrJoin(in_edges[i], ", "), is_source,
-        is_sink);
+    absl::StrAppendFormat(&str,
+                          "\n thunk #%05d: op_name=%s, dependencies=[%s], "
+                          "source=%v, sink=%v, priority=%d",
+                          i, thunk.info().op_name,
+                          absl::StrJoin(in_edges[i], ", "), is_source, is_sink,
+                          nodes_defs_[i].priority);
   }
 
   return str;
+}
+
+ThunkExecutor::FifoReadyQueue::FifoReadyQueue(
+    absl::Span<const NodeId> ready_nodes)
+    : queue_(ready_nodes.begin(), ready_nodes.end()) {}
+
+void ThunkExecutor::FifoReadyQueue::Push(NodeId id) { queue_.push_back(id); }
+
+ThunkExecutor::NodeId ThunkExecutor::FifoReadyQueue::Pop() {
+  DCHECK(!Empty()) << "Queue must not be empty";
+  return queue_[head_++];
+}
+
+ThunkExecutor::FifoReadyQueue ThunkExecutor::FifoReadyQueue::PopHalf() {
+  DCHECK(!Empty()) << "Queue must not be empty";
+  auto mid = queue_.begin() + head_ + Size() / 2;
+  FifoReadyQueue popped(absl::MakeConstSpan(&*mid, queue_.end() - mid));
+  queue_.resize(mid - queue_.begin());
+  return popped;
+}
+
+size_t ThunkExecutor::FifoReadyQueue::Size() const {
+  return queue_.size() - head_;
+}
+
+bool ThunkExecutor::FifoReadyQueue::Empty() const {
+  return head_ == queue_.size();
+}
+
+ThunkExecutor::FifoReadyQueue
+ThunkExecutor::FifoReadyQueue::CreateEmptyReadyQueue() const {
+  return FifoReadyQueue(absl::Span<const NodeId>());
+}
+
+ThunkExecutor::PriorityReadyQueue::PriorityReadyQueue(
+    absl::Span<const NodeDef> nodes_defs, absl::Span<const NodeId> ready_nodes)
+    : nodes_defs_(nodes_defs),
+      queue_(ready_nodes.begin(), ready_nodes.end(), Compare{nodes_defs}) {}
+
+void ThunkExecutor::PriorityReadyQueue::Push(NodeId id) { queue_.push(id); }
+
+ThunkExecutor::NodeId ThunkExecutor::PriorityReadyQueue::Pop() {
+  DCHECK(!Empty()) << "Queue must not be empty";
+  NodeId id = queue_.top();
+  queue_.pop();
+  return id;
+}
+
+ThunkExecutor::PriorityReadyQueue ThunkExecutor::PriorityReadyQueue::PopHalf() {
+  DCHECK(!Empty()) << "Queue must not be empty";
+  int64_t keep_top_nodes = queue_.size() / 2;
+
+  // First pop nodes with highest priority from the queue.
+  PriorityReadyQueue popped(nodes_defs_, {});
+  while (keep_top_nodes-- > 0) {
+    popped.queue_.push(queue_.top());
+    queue_.pop();
+  }
+
+  // Swap popped nodes with remaining nodes, to return to the caller nodes with
+  // smaller priorities, and keep higher priority nodes in the queue.
+  popped.queue_.swap(queue_);
+
+  return popped;
+}
+
+size_t ThunkExecutor::PriorityReadyQueue::Size() const { return queue_.size(); }
+
+bool ThunkExecutor::PriorityReadyQueue::Empty() const { return queue_.empty(); }
+
+ThunkExecutor::PriorityReadyQueue
+ThunkExecutor::PriorityReadyQueue::CreateEmptyReadyQueue() const {
+  return PriorityReadyQueue(nodes_defs_, {});
 }
 
 }  // namespace xla::cpu

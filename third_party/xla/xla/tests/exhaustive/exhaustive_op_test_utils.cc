@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "xla/tests/exhaustive/exhaustive_op_test_utils.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstddef>
@@ -89,6 +90,64 @@ bool IsMinNormalImaginary(xla::complex64 value) {
 bool IsMinPositiveImaginary(xla::complex128 value) {
   return IsMinNormal(value.imag());
 }
+
+/*static*/ ErrorSpec::Builder builder() { return ErrorSpecBuilder(); }
+
+ErrorSpecBuilder& ErrorSpecBuilder::abs_err(double abs_err) & {
+  spec_.abs_err = abs_err;
+  return *this;
+}
+
+ErrorSpecBuilder& ErrorSpecBuilder::rel_err(double rel_err) & {
+  spec_.rel_err = rel_err;
+  return *this;
+}
+
+ErrorSpecBuilder& ErrorSpecBuilder::distance_err(int64_t distance_err) & {
+  spec_.distance_err = distance_err;
+  return *this;
+}
+
+ErrorSpecBuilder& ErrorSpecBuilder::strict_signed_zeros(
+    bool strict_signed_zeros) & {
+  spec_.strict_signed_zeros = strict_signed_zeros;
+  return *this;
+}
+
+ErrorSpecBuilder& ErrorSpecBuilder::skip_comparison(bool skip_comparison) & {
+  spec_.skip_comparison = skip_comparison;
+  return *this;
+}
+
+ErrorSpecBuilder&& ErrorSpecBuilder::abs_err(double abs_err) && {
+  spec_.abs_err = abs_err;
+  return std::move(*this);
+}
+
+ErrorSpecBuilder&& ErrorSpecBuilder::rel_err(double rel_err) && {
+  spec_.rel_err = rel_err;
+  return std::move(*this);
+}
+
+ErrorSpecBuilder&& ErrorSpecBuilder::distance_err(int64_t distance_err) && {
+  spec_.distance_err = distance_err;
+  return std::move(*this);
+}
+
+ErrorSpecBuilder&& ErrorSpecBuilder::strict_signed_zeros(
+    bool strict_signed_zeros) && {
+  spec_.strict_signed_zeros = strict_signed_zeros;
+  return std::move(*this);
+}
+
+ErrorSpecBuilder&& ErrorSpecBuilder::skip_comparison(bool skip_comparison) && {
+  spec_.skip_comparison = skip_comparison;
+  return std::move(*this);
+}
+
+ErrorSpecBuilder::operator ErrorSpec() && { return std::move(*this).build(); }
+
+ErrorSpec ErrorSpecBuilder::build() && { return spec_; }
 
 // For f64, f32, f16, and bf16, we need 17, 9, 5, and 4 decimal places of
 // precision to be guaranteed that we're printing the full number.
@@ -491,6 +550,9 @@ void ExhaustiveOpTestBase<T, N>::ExpectNear(
     }
 
     ErrorSpec error_spec = CallErrorSpec(error_spec_gen, inputs);
+    ASSERT_GE(error_spec.abs_err, 0.0);
+    ASSERT_GE(error_spec.rel_err, 0.0);
+    ASSERT_GE(error_spec.distance_err, 0.0);
 
     if (error_spec.skip_comparison) {
       PrintSkipped(&skipped, [&] {
@@ -552,7 +614,7 @@ void ExhaustiveOpTestBase<T, N>::ExpectNear(
           result = pure_subnormal_cache[cache_loc];
         }
       } else {
-        result = result = CallOperation(evaluate_op, test_value);
+        result = CallOperation(evaluate_op, test_value);
       }
 
       if (IsClose(result, static_cast<NativeRefT>(actual), error_spec)) {

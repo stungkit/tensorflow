@@ -179,6 +179,11 @@ std::optional<double> GetConstantValue(const HloInstruction* inst) {
           using NativeT = NativeTypeOf<primitive_type_constant>;
           return static_cast<double>(
               inst->literal().GetFirstElement<NativeT>());
+        } else if constexpr (primitive_util::IsIntegralType(
+                                 primitive_type_constant)) {
+          using NativeT = NativeTypeOf<primitive_type_constant>;
+          return static_cast<int64_t>(
+              inst->literal().GetFirstElement<NativeT>());
         }
         return std::nullopt;
       },
@@ -605,6 +610,11 @@ std::unique_ptr<HloInstruction> MakeScalarInstruction(HloInstruction* target,
       [&](auto primitive_type_constant) -> std::unique_ptr<HloInstruction> {
         if constexpr (primitive_util::IsFloatingPointType(
                           primitive_type_constant)) {
+          using NativeT = NativeTypeOf<primitive_type_constant>;
+          return HloInstruction::CreateConstant(
+              LiteralUtil::CreateR0<NativeT>(static_cast<NativeT>(multiplier)));
+        } else if constexpr (primitive_util::IsIntegralType(
+                                 primitive_type_constant)) {
           using NativeT = NativeTypeOf<primitive_type_constant>;
           return HloInstruction::CreateConstant(
               LiteralUtil::CreateR0<NativeT>(static_cast<NativeT>(multiplier)));
@@ -3331,12 +3341,11 @@ AlgebraicSimplifierVisitor::AssociativeReorderDotOperator(
     } else if (opcode == HloOpcode::kBroadcast) {
       // Broadcasts of dot contracting dimensions can be reordered to reduces
       // of the corresponding contracting dimensions in the other dot operand
-      DimensionVector reduce_dims, broadcast_dim_sizes;
+      DimensionVector reduce_dims;
       const int64_t pre_broadcast_rank =
           reorder_from->mutable_operand(0)->shape().rank();
       int64_t post_broadcast_rank = reorder_from->shape().rank();
       Shape new_broadcast_shape = reorder_from->shape();
-      DimensionVector contracting_reordered;
 
       // Construct map from broadcasted shape to its original shape. Broadcast
       // dimensions are mapped to -1 since they were not present
@@ -4280,6 +4289,19 @@ absl::StatusOr<std::unique_ptr<HloInstruction>> MinMaxToClamp(
 }
 }  // namespace
 
+bool AlgebraicSimplifierVisitor::IsNondecreasingSublinear(
+    const HloInstruction* hlo) {
+  switch (hlo->opcode()) {
+    case HloOpcode::kCbrt:
+    case HloOpcode::kErf:
+    case HloOpcode::kLogistic:
+    case HloOpcode::kTanh:
+      return true;
+    default:
+      return false;
+  }
+}
+
 absl::Status AlgebraicSimplifierVisitor::HandleMaximum(
     HloInstruction* maximum) {
   HloInstruction *lhs, *rhs;
@@ -4348,6 +4370,33 @@ absl::Status AlgebraicSimplifierVisitor::HandleMaximum(
         ReplaceInstructionIfCompatible(maximum, clamp)) {
       return absl::OkStatus();
     }
+  }
+
+  // If the operands of the max are the same non-decreasing function, then we
+  // can sink it; i.e. max(tanh(x), tanh(y)) to tanh(max(x, y))
+  // We only do this if the function asymptotically satisfies |f(x)| <= |x| to
+  // guarantee that no overflow occurs. Proof of correctness:
+  /* https://cvc5.github.io/app/
+  (set-logic ALL)
+  (declare-fun f (Float32) Float32)
+  (assert (forall ((x Float32) (y Float32))
+                  (=> (fp.lt x y) (fp.leq (f x) (f y))))) ; NonDecreasing
+  (assert (forall ((x Float32))
+                  (fp.leq (fp.abs (f x)) (fp.abs x)))) ; Sublinear
+  (assert (not (forall ((x Float32) (y Float32))
+                       (fp.eq (fp.max (f x) (f y))
+                              (f (fp.max x y)))))) ; Expect unsat
+  (check-sat)
+  */
+  if (lhs->opcode() == rhs->opcode() && IsNondecreasingSublinear(lhs)) {
+    TF_ASSIGN_OR_RETURN(
+        auto new_maximum,
+        MakeBinaryHlo(HloOpcode::kMaximum, lhs->mutable_operand(0),
+                      rhs->mutable_operand(0)));
+    VLOG(10) << "Sinking nondecreasing op through max";
+    return ReplaceWithNewInstruction(
+        maximum, HloInstruction::CreateUnary(maximum->shape(), lhs->opcode(),
+                                             new_maximum));
   }
 
   return absl::OkStatus();
@@ -7839,27 +7888,6 @@ absl::Status AlgebraicSimplifierVisitor::HandleReduce(HloInstruction* hlo) {
     }
   }
 
-  // Replace Reduce(Broadcast(x), dims, Sum()) with Broadcast(x * prod(dims)).
-  if (HloInstruction * broadcast_arg;
-      Match(arg, m::Broadcast(m::ConstantScalar(&broadcast_arg))) &&
-      Match(function->root_instruction(),
-            m::AddAnyOrder(m::Parameter(0), m::Parameter(1)))) {
-    if (auto broadcast_value = GetConstantValue(broadcast_arg);
-        broadcast_value.has_value() &&
-        // Skip float64, where product is too accurate compared to repeated-sum.
-        broadcast_arg->shape().element_type() != PrimitiveType::F64) {
-      auto result_value = broadcast_value.value() *
-                          ShapeUtil::ElementsIn(arg->shape()) /
-                          ShapeUtil::ElementsIn(reduce_result_shape);
-      return ReplaceWithNewInstruction(
-          reduce, HloInstruction::CreateBroadcast(
-                      reduce_result_shape,
-                      reduce->AddInstruction(
-                          MakeScalarInstruction(reduce, result_value)),
-                      {}));
-    }
-  }
-
   // For Computation equal to Min, Max, And or Or, replace Reduce(Broadcast(x),
   // a, Computation()) with Computation(x, a) when x is a scalar and the
   // broadcast is reduced to a scalar.
@@ -7883,26 +7911,52 @@ absl::Status AlgebraicSimplifierVisitor::HandleReduce(HloInstruction* hlo) {
     }
   }
 
-  // Replace Reduce(Broadcast(Scalar)) with Broadcast(Multiply(Scalar)) when the
-  // reduction operation is addition
+  // Replace Reduce(Broadcast(x), +, init_value) with Broadcast(Add(Multiply(x),
+  // init_value))) if all reduction dimensions were introduced by Broadcast
   if (arg->opcode() == HloOpcode::kBroadcast &&
-      ShapeUtil::IsScalar(arg->operand(0)->shape())) {
-    if (Match(reduce->to_apply()->root_instruction(),
-              m::AddAnyOrder(m::Parameter(0), m::Parameter(1))) &&
-        IsScalarConstantZero(init_value)) {
-      int64_t reduction_dims_prod = 1;
-      for (auto i : reduce->dimensions()) {
-        reduction_dims_prod *= arg->shape().dimensions(i);
-      }
+      Match(reduce->to_apply()->root_instruction(),
+            m::AddAnyOrder(m::Parameter(0), m::Parameter(1)))) {
+    bool only_reduce_dims_from_broadcast = true;
+    int64_t common_dims_prod = 1;
+    int64_t num_common_dims = 0;
+    Shape new_broadcast_shape = arg->shape();
+    std::vector<int64_t> new_broadcast_dims;
 
+    // Now we build up the new broadcast shape and dims vector
+    for (int64_t i = 0; i < arg->shape().rank(); ++i) {
+      bool added_by_broadcast = !absl::c_linear_search(arg->dimensions(), i);
+      bool removed_by_reduce = absl::c_linear_search(reduce->dimensions(), i);
+
+      if (removed_by_reduce && !added_by_broadcast) {
+        only_reduce_dims_from_broadcast = false;
+        break;
+      } else if (removed_by_reduce && added_by_broadcast) {
+        new_broadcast_shape.DeleteDimension(i - num_common_dims);
+        common_dims_prod *= arg->shape().dimensions(i);
+        num_common_dims++;
+      } else if (!removed_by_reduce && !added_by_broadcast) {
+        new_broadcast_dims.push_back(i - num_common_dims);
+      }
+    }
+
+    if (only_reduce_dims_from_broadcast) {
+      // HloConstantFolding will later remove any unnecessary multiply and add
+      // instructions.
       HloInstruction* multiplier =
-          MakeScalarLike(arg->mutable_operand(0), reduction_dims_prod);
+          MakeScalarLike(arg->mutable_operand(0), common_dims_prod);
       TF_ASSIGN_OR_RETURN(HloInstruction * multiplied_scalar,
                           MakeBinaryHlo(HloOpcode::kMultiply,
                                         arg->mutable_operand(0), multiplier));
+      TF_ASSIGN_OR_RETURN(
+          HloInstruction * add,
+          MakeBinaryHlo(
+              HloOpcode::kAdd,
+              MakeBroadcastHlo(init_value, {}, multiplied_scalar->shape()),
+              multiplied_scalar));
+      VLOG(10) << "Converting common reduce(broadcast) dimensions to multiply";
       return ReplaceWithNewInstruction(
-          reduce, HloInstruction::CreateBroadcast(reduce->shape(),
-                                                  multiplied_scalar, {}));
+          reduce, HloInstruction::CreateBroadcast(new_broadcast_shape, add,
+                                                  new_broadcast_dims));
     }
   }
 

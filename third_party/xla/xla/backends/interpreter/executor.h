@@ -86,15 +86,6 @@ class XlaInterpreterExecutor : public StreamExecutorCommon {
   absl::Status Init() override { return absl::OkStatus(); }
 
   int device_ordinal() const override { return device_ordinal_; };
-  absl::StatusOr<std::unique_ptr<Kernel>> LoadKernel(
-      const MultiKernelLoaderSpec &spec) override {
-    return absl::UnimplementedError("Not Implemented");
-  }
-  absl::Status Launch(Stream *stream, const ThreadDim &thread_dims,
-                      const BlockDim &block_dims, const Kernel &kernel,
-                      const KernelArgs &args) override {
-    return absl::UnimplementedError("Not Implemented");
-  }
 
   DeviceMemoryBase Allocate(uint64_t size, int64_t memory_space) override;
   void Deallocate(DeviceMemoryBase *mem) override;
@@ -103,7 +94,7 @@ class XlaInterpreterExecutor : public StreamExecutorCommon {
       uint64_t size) override {
     return std::make_unique<HostMemoryAllocation>(new char[size], size, this);
   }
-  void HostMemoryDeallocate(void *mem, uint64_t size) override {
+  void HostMemoryDeallocate(void *mem) override {
     delete[] static_cast<char *>(mem);
   }
 
