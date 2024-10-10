@@ -322,9 +322,13 @@ CodegenDecision IsTritonSupportedInstructionImpl(
     case HloOpcode::kTranspose:
     case HloOpcode::kParameter:
     case HloOpcode::kBroadcast:
-    case HloOpcode::kBitcast:
-    case HloOpcode::kReshape:
       return CodegenDecision::Allow();
+    case HloOpcode::kBitcast:
+
+    case HloOpcode::kReshape:
+      return (instr.shape().rank() == 0 && instr.operand(0)->shape().rank() > 0)
+                 ? CodegenDecision::Forbid("0D reshapes are not yet supported.")
+                 : CodegenDecision::Allow();
     default:
       VLOG(2) << "Unsupported instruction: " << instr.ToString();
       break;

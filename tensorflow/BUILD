@@ -13,7 +13,7 @@ load(
     "if_google",
     "if_oss",
     "if_xla_available",
-    "tf_cc_shared_object",
+    "pywrap_aware_tf_cc_shared_object",
     "tf_custom_op_library_additional_deps_impl",
     "tf_monitoring_python_deps",
     "tf_native_cc_binary",
@@ -751,7 +751,7 @@ alias(
     name = "is_cuda_enabled",
     actual = if_oss(
         "@local_config_cuda//:is_cuda_enabled",
-        "@local_config_cuda//cuda:using_clang",
+        "@local_config_cuda//cuda:using_config_cuda",
     ),
 )
 
@@ -765,6 +765,14 @@ alias(
     ),
 )
 
+selects.config_setting_group(
+    name = "is_cuda_clang",
+    match_all = [
+        ":is_cuda_enabled",
+        ":is_cuda_compiler_clang",
+    ],
+)
+
 # Config setting that is satisfied when CUDA device code should be compiled
 # with nvcc. It does not imply that CUDA support has been enabled.
 alias(
@@ -773,6 +781,14 @@ alias(
         "@local_config_cuda//:is_cuda_compiler_nvcc",
         "@local_config_cuda//cuda:FALSE",
     ),
+)
+
+selects.config_setting_group(
+    name = "is_cuda_nvcc",
+    match_all = [
+        ":is_cuda_enabled",
+        ":is_cuda_compiler_nvcc",
+    ],
 )
 
 # Config setting that is satisfied when building with --config=cuda in OSS.
@@ -1069,18 +1085,11 @@ bzl_library(
         "@local_config_cuda//cuda:build_defs_bzl",
         "@local_config_rocm//rocm:build_defs_bzl",
         "@local_config_tensorrt//:build_defs_bzl",
-        "@local_tsl//tsl/platform/default:cuda_build_defs_bzl",
+        "@local_tsl//third_party/py/rules_pywrap:pywrap_bzl",
         "@local_xla//xla/tsl:tsl_bzl",
         "@local_xla//xla/tsl/mkl:build_defs_bzl",
         "@rules_java//java:rules",
     ],
-)
-
-bzl_library(
-    name = "tensorflow_default_bzl",
-    srcs = ["tensorflow.default.bzl"],
-    visibility = ["//visibility:public"],
-    deps = [":tensorflow_bzl"],
 )
 
 # TODO(jakeharmon8): Remove these in favor of tsl:grpc
@@ -1216,7 +1225,7 @@ cc_import(
 # an "-exported_symbols_list" command.  -z defs disallows undefined
 # symbols in object files.
 
-tf_cc_shared_object(
+pywrap_aware_tf_cc_shared_object(
     name = "tensorflow",
     linkopts = select({
         "//tensorflow:macos": [

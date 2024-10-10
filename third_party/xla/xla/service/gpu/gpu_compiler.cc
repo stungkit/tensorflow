@@ -160,6 +160,7 @@ limitations under the License.
 #include "xla/service/gpu/transforms/dot_operand_converter.h"
 #include "xla/service/gpu/transforms/double_buffer_loop_unrolling.h"
 #include "xla/service/gpu/transforms/dynamic_slice_fusion_rewriter.h"
+#include "xla/service/gpu/transforms/fusion_block_level_rewriter.h"
 #include "xla/service/gpu/transforms/fusion_wrapper.h"
 #include "xla/service/gpu/transforms/gemm_broadcast_folding_rewriter.h"
 #include "xla/service/gpu/transforms/gemm_fusion.h"
@@ -224,7 +225,6 @@ limitations under the License.
 #include "xla/service/slice_sinker.h"
 #include "xla/service/slow_operation_alarm.h"
 #include "xla/service/sort_simplifier.h"
-#include "xla/service/spmd/shardy/shardy_call_inliner.h"
 #include "xla/service/stable_sort_expander.h"
 #include "xla/service/stochastic_convert_decomposer.h"
 #include "xla/service/sub_byte_normalization.h"
@@ -524,6 +524,10 @@ AlgebraicSimplifierOptions LayoutInsensitiveAlgebraicSimplifierOptions(
   // GPU only supports canonical convolutions.
   layout_insensitive_algsimp_opts.set_supports_non_canonical_dots(false);
 
+  // On GPU it helps to reorder them so that the fused cuDNN kernel can be
+  // used.
+  layout_insensitive_algsimp_opts.set_enable_conv_add_multiply_reorder(true);
+
   // "slow" minmax means we propagate nan.
   layout_insensitive_algsimp_opts.set_minmax_propagate_nan(
       !hlo_module_config.debug_options().xla_gpu_enable_fast_min_max());
@@ -552,7 +556,7 @@ absl::Status RunPreSPMDPartitionerPasses(HloModule* hlo_module) {
   // passes.
   pre_spmd_pipeline.AddPass<CuDnnCustomCallConverter>();
   pre_spmd_pipeline.AddPass<ConvertMemoryPlacementToInternalAnnotations>();
-  pre_spmd_pipeline.AddPass<ShardyCallInliner>();
+  pre_spmd_pipeline.AddPass<CallInliner>();
   pre_spmd_pipeline.AddPass<ZeroSizedHloElimination>();
   pre_spmd_pipeline.AddPass<ConditionalCanonicalizer>();
 
@@ -709,7 +713,7 @@ absl::Status RunOptimizationPasses(
   pipeline.AddPass<DynamicIndexSplitter>();
 
   // TODO(b/64094172): make Call work on GPU instead of inlining.
-  pipeline.AddPass<ShardyCallInliner>();
+  pipeline.AddPass<CallInliner>();
 
   pipeline.AddPass<StochasticConvertDecomposer>();
 
@@ -921,6 +925,12 @@ absl::Status RunCollectiveOptimizationPasses(
       /*enable_reduce_scatter=*/debug_options
           .xla_gpu_enable_while_loop_reduce_scatter_code_motion());
 
+  // Moves collectives' subsequent quantization before the collective to
+  // minimize data transfers.
+  collectives_pipeline.AddPass<CollectiveQuantizer>();
+  // Remove dead computations after collective quantization.
+  collectives_pipeline.AddPass<HloDCE>();
+
   if (!debug_options.xla_gpu_run_post_layout_collective_pipeliner()) {
     TF_RETURN_IF_ERROR(
         AddCollectivePipelinerPasses(debug_options, collectives_pipeline));
@@ -957,12 +967,6 @@ absl::Status RunCollectiveOptimizationPasses(
       {U16, U32}, {S16, S32}};
   collectives_pipeline.AddPass<AllReducePromotion>(ar_promoted_types);
   // Remove dead computations left over after ar/rs promotion.
-  collectives_pipeline.AddPass<HloDCE>();
-
-  // Moves collectives' subsequent quantization before the collective to
-  // minimize data transfers.
-  collectives_pipeline.AddPass<CollectiveQuantizer>();
-  // Remove dead computations after collective quantization.
   collectives_pipeline.AddPass<HloDCE>();
 
   // Run WhileLoopTripCountAnnotator after collective pipelining and before
@@ -1227,6 +1231,7 @@ absl::Status RunLayoutNormalizationPasses(
   opts.set_supports_non_canonical_dots(false);
   opts.set_is_layout_sensitive(true);
   opts.set_enable_conv_operand_swap(false);
+  opts.set_enable_conv_add_multiply_reorder(true);
   // "slow" minmax means we propagate nan.
   opts.set_minmax_propagate_nan(!debug_options.xla_gpu_enable_fast_min_max());
   opts.set_enable_unconditional_reduce_of_concat_replacement(false);
@@ -1430,6 +1435,7 @@ absl::Status GpuCompiler::OptimizeHloPostLayoutAssignment(
     opts.set_supports_non_canonical_dots(false);
     opts.set_is_layout_sensitive(true);
     opts.set_enable_conv_operand_swap(false);
+    opts.set_enable_conv_add_multiply_reorder(true);
     // "slow" minmax means we propagate nan.
     opts.set_minmax_propagate_nan(!debug_options.xla_gpu_enable_fast_min_max());
     opts.set_enable_unconditional_reduce_of_concat_replacement(false);
@@ -1594,7 +1600,7 @@ absl::Status GpuCompiler::OptimizeHloPostLayoutAssignment(
       options.key_value_store,
       gpu_target_config.device_description.runtime_version()));
   // Inline back the calls which have better performance with cuBLAS.
-  pipeline.AddPass<ShardyCallInliner>();
+  pipeline.AddPass<CallInliner>();
   // TODO(tdanyluk): Apply CublasPadForGemms to the cuBLAS GEMMs generated
   // here for possibly better cuBLAS performance.
   AddGemmRewriterPasses(pipeline, debug_options, gpu_version,
@@ -1726,6 +1732,20 @@ absl::StatusOr<std::unique_ptr<HloModule>> GpuCompiler::RunHloPasses(
                                        options, gpu_target_config));
 
   TF_RETURN_IF_ERROR(PrepareHloModuleForIrEmitting(module.get()));
+
+  // This needs to run after every pass affecting fusions, which includes
+  // `CopyFusion`, which itself must run in the `PrepareHloModuleForIrEmitting`
+  // pipeline.
+  if (module->config()
+          .debug_options()
+          .xla_gpu_experimental_enable_fusion_block_level_rewriter()) {
+    // Even though this is a single pass, we need to create a pipeline in order
+    // to make sure the pass's run is recorded in the `HloModuleMetadata`.
+    HloPassPipeline pipeline("fusion-block-level-rewriter-pipeline");
+    pipeline.AddPass<FusionBlockLevelRewriter>(
+        gpu_target_config.device_description, ShapeSizeBytesFunction());
+    TF_RETURN_IF_ERROR(pipeline.Run(module.get()).status());
+  }
 
   uint64_t end_usecs = tsl::Env::Default()->NowMicros();
 
