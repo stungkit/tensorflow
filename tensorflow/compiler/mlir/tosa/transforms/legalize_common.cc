@@ -592,6 +592,12 @@ std::optional<Value> convertMultiplyOp(PatternRewriter& rewriter, Operation* op,
     return std::nullopt;
   }
 
+  if (EqualizeRanks(rewriter, op->getLoc(), input_lhs_val, input_rhs_val)
+          .failed())
+    return std::nullopt;
+  input_lhs_type = dyn_cast<ShapedType>(input_lhs_val.getType());
+  input_rhs_type = dyn_cast<ShapedType>(input_rhs_val.getType());
+
   if (output_is_qtype) {
     ShapedType rescale_type = output_type.clone(rewriter.getI32Type());
     auto input_lhs_qtype = mlir::cast<mlir::quant::UniformQuantizedType>(
@@ -662,6 +668,12 @@ std::optional<Value> convertSquaredDifferenceOp(PatternRewriter& rewriter,
         "input/output tensor should all be in FP32, INT32 or quantized INT8");
     return std::nullopt;
   }
+
+  if (EqualizeRanks(rewriter, op->getLoc(), x, y)
+          .failed())
+    return std::nullopt;
+  x_type = dyn_cast<ShapedType>(x.getType());
+  y_type = dyn_cast<ShapedType>(y.getType());
 
   // If the output is I8 then we need to rescale to I32
   // Then scale back to I8
@@ -3099,7 +3111,7 @@ std::optional<Value> convertReduceProdOp(PatternRewriter& rewriter,
     return std::nullopt;
   }
 
-  return convertReduceOpCommon<tosa::ReduceProdOp>(
+  return convertReduceOpCommon<tosa::ReduceProductOp>(
       rewriter, op, output_type, input_value, axes_elems,
       output_type.getElementType(), false, 1.0f, 0, 1.0f, 0);
 }

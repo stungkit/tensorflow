@@ -1819,6 +1819,7 @@ xla_test(
         "//xla/hlo/testlib:test",
         "//xla/hlo/testlib:test_helpers",
         "@com_google_absl//absl/status:statusor",
+        "@eigen_archive//:eigen3",
     ],
 )
 
@@ -2781,11 +2782,15 @@ xla_test(
         "//xla/service/gpu:backend_configs_cc",
         "//xla/stream_executor:device_description",
         "//xla/stream_executor/cuda:cuda_compute_capability",
+        "//xla/tsl/lib/core:status_test_util",
+        "//xla/tsl/platform:errors",
         "//xla/tsl/platform:statusor",
         "//xla/tsl/platform:test",
+        "@com_google_absl//absl/algorithm:container",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:string_view",
@@ -3669,7 +3674,7 @@ xla_test(
 bzl_library(
     name = "plugin_bzl",
     srcs = ["plugin.bzl"],
-    deps = [],
+    deps = ["//xla/tsl:package_groups_bzl"],
 )
 
 bzl_library(
@@ -3679,6 +3684,7 @@ bzl_library(
         ":plugin_bzl",
         "//xla:xla_bzl",
         "//xla/stream_executor:build_defs_bzl",
+        "//xla/tsl:package_groups_bzl",
         "//xla/tsl/platform:build_config_root_bzl",
         "//xla/tsl/platform/default:build_config_bzl",
     ] + tests_build_defs_bzl_deps(),

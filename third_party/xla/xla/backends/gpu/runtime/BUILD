@@ -790,9 +790,11 @@ cc_library(
         "//xla/core/collectives:rank_id",
         "//xla/hlo/ir:hlo",
         "//xla/service:collective_ops_utils",
+        "//xla/service:rendezvous",
         "//xla/service/gpu/transforms/collectives:collective_ops_utils",
         "//xla/stream_executor:device_memory",
         "//xla/stream_executor:device_memory_handle",
+        "//xla/stream_executor:event",
         "//xla/stream_executor:memory_allocation",
         "//xla/stream_executor:stream",
         "//xla/tsl/platform:errors",
@@ -1232,6 +1234,30 @@ cc_library(
         "@local_tsl//tsl/platform:statusor",
         "@local_tsl//tsl/profiler/lib:traceme",
         "@local_tsl//tsl/profiler/lib:traceme_encode",
+    ],
+)
+
+xla_test(
+    name = "while_thunk_test",
+    srcs = ["while_thunk_test.cc"],
+    backends = ["gpu"],
+    deps = [
+        ":thunk",
+        ":while_thunk",
+        "//xla:executable_run_options",
+        "//xla/service:executable",
+        "//xla/service:platform_util",
+        "//xla/service/gpu:buffer_allocations",
+        "//xla/stream_executor:platform",
+        "//xla/stream_executor:platform_manager",
+        "//xla/stream_executor:stream",
+        "//xla/stream_executor:stream_executor_memory_allocator",
+        "//xla/tests:hlo_test_base",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_googletest//:gtest_main",
+        "@local_tsl//tsl/platform:status_matchers",
+        "@local_tsl//tsl/platform:statusor",
+        "@local_tsl//tsl/platform:test",
     ],
 )
 
