@@ -141,11 +141,9 @@ limitations under the License.
 #include "xla/hlo/transforms/simplifiers/tuple_simplifier.h"
 #include "xla/hlo/transforms/simplifiers/zero_sized_hlo_elimination.h"
 #include "xla/hlo/transforms/while_loop_trip_count_annotator.h"
-#include "xla/literal.h"
 #include "xla/literal_pool.h"
 #include "xla/map_util.h"
 #include "xla/mlir_hlo/transforms/passes.h"
-#include "xla/primitive_util.h"
 #include "xla/service/all_reduce_promotion.h"
 #include "xla/service/all_to_all_decomposer.h"
 #include "xla/service/batched_gather_scatter_normalizer.h"
@@ -160,6 +158,7 @@ limitations under the License.
 #include "xla/service/copy_insertion.h"
 #include "xla/service/cpu/buffer_info_util.h"
 #include "xla/service/cpu/conv_canonicalization.h"
+#include "xla/service/cpu/cpu_aot_compilation_result.h"
 #include "xla/service/cpu/cpu_executable.h"
 #include "xla/service/cpu/cpu_instruction_fusion.h"
 #include "xla/service/cpu/cpu_layout_assignment.h"
@@ -311,40 +310,6 @@ ModuleComputationsTransitivelyContainCustomCall(const HloModule& module) {
 }  // namespace
 
 namespace cpu {
-using BufferInfo = cpu_function_runtime::BufferInfo;
-
-CpuAotCompilationOptions::CpuAotCompilationOptions(
-    std::string triple, std::string cpu_name, std::string features,
-    std::string entry_point_name, RelocationModel relocation_model)
-    : triple_(std::move(triple)),
-      cpu_name_(std::move(cpu_name)),
-      features_(std::move(features)),
-      entry_point_name_(std::move(entry_point_name)),
-      relocation_model_(relocation_model) {}
-
-CpuAotCompilationOptions::~CpuAotCompilationOptions() = default;
-
-se::Platform::Id CpuAotCompilationOptions::PlatformId() const {
-  return se::host::kHostPlatformId;
-}
-
-CpuAotCompilationResult::CpuAotCompilationResult(
-    ObjectFileData object_file_data, std::vector<BufferInfo> buffer_infos,
-    int64_t result_buffer_index, std::unique_ptr<HloModule> module,
-    std::unique_ptr<HloProfilePrinterData> hlo_profile_printer_data)
-    : object_file_data_(std::move(object_file_data)),
-      buffer_infos_(std::move(buffer_infos)),
-      result_buffer_index_(result_buffer_index),
-      module_(std::move(module)),
-      hlo_profile_printer_data_(std::move(hlo_profile_printer_data)) {}
-
-const HloModule* CpuAotCompilationResult::optimized_module() const {
-  return module_.get();
-}
-
-std::unique_ptr<HloModule> CpuAotCompilationResult::consume_optimized_module() {
-  return std::move(module_);
-}
 
 CpuCompiler::CpuCompiler() {
   // Initialize LLVM the first time the CpuCompiler is initialized.
@@ -472,6 +437,52 @@ void AddHloVerifier(HloPassPipeline* pipeline, HloVerifierOpts&& opts = {},
     pipeline->AddInvariantChecker<HloVerifier>(std::move(verifier_metadata),
                                                "hlo verifier");
   }
+}
+
+std::unique_ptr<HloPassFix<HloPassPipeline>> CreateSimplificationPipeline(
+    absl::string_view name, HloModule* module) {
+  // Run the following passes to a fixed point.
+  auto pipeline =
+      std::make_unique<HloPassFix<HloPassPipeline>>(std::string(name));
+  AddHloVerifier(pipeline.get(), HloVerifierOpts{},
+                 /*debug_only=*/true);
+
+  AlgebraicSimplifierOptions options;
+  options.set_enable_dot_strength_reduction(false);
+  // TODO(b/209827141): XLA:CPU doesn't propagate NaN through min/max, but
+  // other platforms do, so it should be changed.
+  options.set_minmax_propagate_nan(false);
+  options.set_supports_non_canonical_dots(false);
+  options.set_executing_on_cpu(true);
+  pipeline->AddPass<AlgebraicSimplifier>(options);
+  pipeline->AddPass<SortSimplifier>();
+  pipeline->AddPass<HloDCE>();
+  pipeline->AddPass<GatherExpander>(GatherExpander::kEliminateSimpleGathers);
+
+  // Needs to happen after algebraic simplifier.
+  pipeline->AddPass<TreeReductionRewriter>();
+
+  // BatchNormExpander can create zero-sized ops, so zero-sized HLO
+  // elimination has to come after that pass.
+  pipeline->AddPass<ZeroSizedHloElimination>();
+
+  pipeline->AddPass<WhileLoopInvariantCodeMotion>();
+  pipeline->AddPass<TupleSimplifier>();
+  pipeline->AddPass<WhileLoopConstantSinking>();
+  pipeline->AddPass<WhileLoopSimplifier>();
+
+  // TODO(b/134075051): Re-enable after b/134075051 is fixed.
+  // pipeline->AddPass<SliceSinker>();
+
+  pipeline->AddPass<HloDCE>();
+  pipeline->AddPass<ReshapeMover>();
+  pipeline->AddPass<HloConstantFolding>(
+      options::FoldAllConstants(module->config())
+          ? HloConstantFolding::Level::kAgressive
+          : HloConstantFolding::Level::kDefault);
+  pipeline->AddPass<ConditionalSimplifier>();
+
+  return pipeline;
 }
 
 }  // namespace
@@ -680,50 +691,17 @@ absl::Status CpuCompiler::RunHloPassesThroughLayoutAssn(
         F16, F32, HloPredicateIsOp<HloOpcode::kDot, HloOpcode::kConvolution>);
   }
 
-  // Run the following passes to a fixed point.
-  [&pipeline = pipeline.AddPass<HloPassFix<HloPassPipeline>>("simplification"),
-   module] {
-    AddHloVerifier(&pipeline, HloVerifierOpts{},
-                   /*debug_only=*/true);
+  pipeline.AddPass(CreateSimplificationPipeline("simplification", module));
 
-    AlgebraicSimplifierOptions options;
-    options.set_enable_dot_strength_reduction(false);
-    // TODO(b/209827141): XLA:CPU doesn't propagate NaN through min/max, but
-    // other platforms do, so it should be changed.
-    options.set_minmax_propagate_nan(false);
-    options.set_supports_non_canonical_dots(false);
-    options.set_executing_on_cpu(true);
-    pipeline.AddPass<AlgebraicSimplifier>(options);
-    pipeline.AddPass<SortSimplifier>();
-    pipeline.AddPass<HloDCE>();
-    pipeline.AddPass<GatherExpander>(GatherExpander::kEliminateSimpleGathers);
-
-    // Needs to happen after algebraic simplifier.
-    pipeline.AddPass<TreeReductionRewriter>();
-
-    // BatchNormExpander can create zero-sized ops, so zero-sized HLO
-    // elimination has to come after that pass.
-    pipeline.AddPass<ZeroSizedHloElimination>();
-
-    pipeline.AddPass<WhileLoopInvariantCodeMotion>();
-    pipeline.AddPass<TupleSimplifier>();
-    pipeline.AddPass<WhileLoopConstantSinking>();
-    pipeline.AddPass<WhileLoopSimplifier>();
-
-    // TODO(b/134075051): Re-enable after b/134075051 is fixed.
-    // pipeline.AddPass<SliceSinker>();
-
-    pipeline.AddPass<HloDCE>();
-    pipeline.AddPass<ReshapeMover>();
-    pipeline.AddPass<HloConstantFolding>(
-        options::FoldAllConstants(module->config())
-            ? HloConstantFolding::Level::kAgressive
-            : HloConstantFolding::Level::kDefault);
-    pipeline.AddPass<ConditionalSimplifier>();
-  }();
-
+  // Scatter expander is sandwiched between two simplification pipelines to
+  // enable constant folding with the original scatter instructions (which is
+  // more efficient than with the expanded version) but then to also ensure that
+  // the resulting while loops are simplified.
   pipeline.AddPass<SelectAndScatterExpander>();
   pipeline.AddPass<ScatterExpander>(ScatterExpander::kEliminateAllScatters);
+
+  pipeline.AddPass(CreateSimplificationPipeline(
+      "post_scatter_expansion_simplification", module));
 
   pipeline.AddPass<BitcastDtypesExpander>();
 
@@ -1832,7 +1810,7 @@ CpuCompiler::CompileAheadOfTime(std::unique_ptr<HloModuleGroup> module_group,
       }
 
       TargetMachineFeatures target_machine_features(target_machine.get());
-      std::vector<BufferInfo> buffer_infos =
+      std::vector<cpu_function_runtime::BufferInfo> buffer_infos =
           CreateBufferInfosFromBufferAssignment(*module, *assignment);
       HloComputation* computation = module->entry_computation();
 

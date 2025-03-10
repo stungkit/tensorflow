@@ -116,8 +116,10 @@ DebugOptions DefaultDebugOptionsIgnoringFlags() {
 
   opts.add_xla_gpu_enable_command_buffer(DebugOptions::FUSION);
   opts.add_xla_gpu_enable_command_buffer(DebugOptions::CUBLAS);
+  opts.add_xla_gpu_enable_command_buffer(DebugOptions::CUBLASLT);
   opts.add_xla_gpu_enable_command_buffer(DebugOptions::CUSTOM_CALL);
   opts.add_xla_gpu_enable_command_buffer(DebugOptions::CUDNN);
+  opts.add_xla_gpu_enable_command_buffer(DebugOptions::CONDITIONAL);
   opts.set_xla_gpu_graph_min_graph_size(5);
   opts.set_xla_gpu_graph_enable_concurrent_region(false);
   opts.set_xla_cmd_buffer_trace_cache_size(16);
@@ -202,6 +204,8 @@ DebugOptions DefaultDebugOptionsIgnoringFlags() {
       std::numeric_limits<int64_t>::max());
   opts.set_xla_gpu_experimental_pipeline_parallelism_opt_level(
       DebugOptions::PIPELINE_PARALLELISM_OPT_LEVEL_DISABLE);
+
+  opts.set_xla_gpu_experimental_collective_cse_distance_threshold(0);
 
   opts.set_xla_gpu_experimental_enable_subchannel_dequantisation_fusion(false);
   opts.set_xla_partitioning_algorithm(
@@ -310,6 +314,7 @@ DebugOptions DefaultDebugOptionsIgnoringFlags() {
   opts.set_xla_pjrt_allow_auto_layout_in_hlo(false);
   opts.set_xla_gpu_enable_scatter_determinism_expander(true);
   opts.set_xla_gpu_unsupported_enable_ragged_all_to_all_decomposer(false);
+  opts.set_xla_gpu_unsupported_use_ragged_all_to_all_one_shot_kernel(false);
   opts.set_xla_gpu_experimental_pack_dot_operands_along_k_dimension(true);
   opts.set_xla_unsupported_crash_on_hlo_pass_fix_max_iterations(false);
   opts.set_xla_hlo_pass_fix_detect_cycles(false);
@@ -928,6 +933,12 @@ void MakeDebugOptionsFlags(std::vector<tsl::Flag>* flag_list,
       "*input* layouts. For example, for 2 input arguments with 2D shape and "
       "4D shape, the computation will run 2! * 4! times for every possible "
       "layouts"));
+  flag_list->push_back(tsl::Flag(
+      "xla_test_add_command_buffer_mode",
+      bool_setter_for(&DebugOptions::set_xla_test_add_command_buffer_mode),
+      debug_options->xla_test_add_command_buffer_mode(),
+      "If true, the test launched with ClientLibraryTestBase will use command "
+      "buffer to execute the computation."));
   flag_list->push_back(tsl::Flag(
       "xla_hlo_profile", bool_setter_for(&DebugOptions::set_xla_hlo_profile),
       debug_options->xla_hlo_profile(),
@@ -2219,6 +2230,15 @@ void MakeDebugOptionsFlags(std::vector<tsl::Flag>* flag_list,
       "Internal: Enable the RaggedAllToAllDecomposer, an experimental pass "
       "that rewrites ragged-all-to-all as a dense all-to-all operation."));
   flag_list->push_back(tsl::Flag(
+      "xla_gpu_unsupported_use_ragged_all_to_all_one_shot_kernel",
+      bool_setter_for(
+          &DebugOptions::
+              set_xla_gpu_unsupported_use_ragged_all_to_all_one_shot_kernel),
+      debug_options
+          ->xla_gpu_unsupported_use_ragged_all_to_all_one_shot_kernel(),
+      "Internal: Enable the one-shot kernel for single-host ragged-all-to-all "
+      "operations."));
+  flag_list->push_back(tsl::Flag(
       "xla_gpu_experimental_enable_alltoall_windowed_einsum",
       bool_setter_for(
           &DebugOptions::
@@ -2259,6 +2279,13 @@ void MakeDebugOptionsFlags(std::vector<tsl::Flag>* flag_list,
       bool_setter_for(&DebugOptions::set_xla_allow_get_default_platform),
       debug_options->xla_allow_get_default_platform(),
       "If false, GetDefaultPlatform will cause an error if called."));
+  flag_list->push_back(tsl::Flag(
+      "xla_gpu_experimental_collective_cse_distance_threshold",
+      int64_setter_for(
+          &DebugOptions::
+              set_xla_gpu_experimental_collective_cse_distance_threshold),
+      debug_options->xla_gpu_experimental_collective_cse_distance_threshold(),
+      "Set distance threshold for Collective CSE."));
 }  // NOLINT(readability/fn_size)1
 
 // Allocates flag_values and flag_objects; this function must not be called more

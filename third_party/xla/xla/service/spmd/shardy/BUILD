@@ -75,6 +75,7 @@ cc_library(
     hdrs = ["utils.h"],
     deps = [
         ":constants",
+        "//xla/mlir_hlo",
         "@com_google_absl//absl/log:check",
         "@com_google_absl//absl/strings",
         "@llvm-project//llvm:Support",
@@ -123,6 +124,7 @@ xla_cc_binary(
         "//xla/service/spmd/shardy/round_trip_common:import_constants",
         "//xla/service/spmd/shardy/round_trip_common:import_sdy_custom_calls",
         "//xla/service/spmd/shardy/round_trip_common:open_while_free_vars_sharding",
+        "//xla/service/spmd/shardy/sdy_round_trip:dedup_meshes",
         "//xla/service/spmd/shardy/sdy_round_trip:export_ops",
         "//xla/service/spmd/shardy/sdy_round_trip:export_shardy_attrs",
         "//xla/service/spmd/shardy/sdy_round_trip:import_callback_custom_calls",
@@ -146,5 +148,6 @@ xla_cc_binary(
         "@llvm-project//mlir:MlirOptLib",
         "@shardy//shardy/dialect/sdy/ir:register",
         "@shardy//shardy/dialect/sdy/transforms:passes",
+        "@shardy//shardy/round_trip_import:pipelines",
     ],
 )

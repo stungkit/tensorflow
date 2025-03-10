@@ -33,6 +33,7 @@ litert_dynamic_lib(
         "litert_dispatch_device_context.h",
         "litert_dispatch_graph.h",
         "litert_dispatch_invocation_context.h",
+        "litert_dispatch_metrics.h",
         "southbound.h",
         # copybara:uncomment "//third_party/odml/infra/southbound:sb_api.h",
     ],
@@ -50,6 +51,7 @@ litert_dynamic_lib(
     ],
     visibility = ["//tensorflow/lite/experimental/litert:__subpackages__"],
     deps = [
+        "//tensorflow/lite/experimental/litert/c:litert_any",
         "//tensorflow/lite/experimental/litert/c:litert_runtime_c_api_shared_lib",
         "//tensorflow/lite/experimental/litert/cc:litert_expected",
         "//tensorflow/lite/experimental/litert/core/util:tensor_type_util",
@@ -65,6 +67,7 @@ cc_library(
     name = "dispatch_api_shared_lib",
     srcs = [":dispatch_api_so"],
     linkstatic = 1,
+    visibility = ["//visibility:public"],
 )
 
 # Copies the shared library so that it is available for use in test data as libLiteRtDispatch_GoogleTensor.so.

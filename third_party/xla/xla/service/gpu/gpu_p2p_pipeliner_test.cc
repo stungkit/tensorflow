@@ -418,8 +418,7 @@ TEST_F(GpuP2PPipelinerTest, OneSendRecvWithOneConflictingAllReduce) {
           frontend_attributes={_xla_send_recv_source_target_pairs={{0,1},{1,2},{2,3}}},
           control-predecessors={recv}
       recv_done = (f32[64], token[]) recv-done(recv), channel_id=1
-      send_done = token[] send-done(send), channel_id=1,
-          control-predecessors={recv_done}
+      send_done = token[] send-done(send), channel_id=1
       recv_data = f32[64] get-tuple-element(recv_done), index=0
 
       // Conflicting all-reduce.
@@ -472,9 +471,9 @@ TEST_F(GpuP2PPipelinerTest, OneSendRecvWithOneConflictingAllReduce) {
   EXPECT_THAT(send_done_op->control_predecessors(), IsEmpty());
   EXPECT_THAT(ar_op->control_predecessors(),
               UnorderedElementsAre(send_done_op));
-  EXPECT_THAT(recv_op->control_predecessors(),
+  EXPECT_THAT(recv_op->control_predecessors(), IsEmpty());
+  EXPECT_THAT(recv_done_op->control_predecessors(),
               UnorderedElementsAre(send_op, ar_op));
-  EXPECT_THAT(recv_done_op->control_predecessors(), IsEmpty());
 }
 
 TEST_F(GpuP2PPipelinerTest, OneSendRecvWithConflictingAllReduceAfterLoop) {

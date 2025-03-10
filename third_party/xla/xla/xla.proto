@@ -516,6 +516,9 @@ message DebugOptions {
   // Specifies the behavior of per kernel autotuning cache.
   AutotuneCacheMode xla_gpu_experimental_autotune_cache_mode = 324;
 
+  // Specifies the distance threshold in ScheduleAwareCollectiveOpsCSE
+  int64 xla_gpu_experimental_collective_cse_distance_threshold = 374;
+
   // Experimentally disables binary libraries in GPU compiler passes.
   bool xla_gpu_experimental_disable_binary_libraries = 329;
 
@@ -768,6 +771,10 @@ message DebugOptions {
   // TODO(b/395903738): use to make specific tests pass on A100 while working
   // around this bug. The can be removed once the bug is fixed.
   bool xla_gpu_unsupported_force_triton_gemm = 369;
+
+  // Internal testing flag to enable one-shot kernel for single-host
+  // ragged-all-to-all operations.
+  bool xla_gpu_unsupported_use_ragged_all_to_all_one_shot_kernel = 375;
 
   // This instructs the runtime whether to use memcpy for p2p communication when
   // source and target are located within a node(nvlink).
@@ -1168,9 +1175,14 @@ message DebugOptions {
   // its use indicates an error in test setup.
   bool xla_allow_get_default_platform = 371;
 
+  // If true, the test launched with ClientLibraryTestBase will also try to
+  // use command buffer mode to run.
+  bool xla_test_add_command_buffer_mode = 373;
+
   // Note: when adding a new flag, please add it to one of the hardware-specific
   // or hardware-agnostic sections at the top of this proto message.
-  // Next id: 373
+
+  // Next id: 376
 
   // Extra options to pass to the compilation backend (e.g. LLVM); specific
   // interpretation of these values is left to the backend.

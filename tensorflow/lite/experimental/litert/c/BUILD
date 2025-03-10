@@ -2,7 +2,7 @@
 # load("//devtools/deps/check:deps_check.bzl", "check_dependencies")
 #
 # copybara:uncomment_end
-load("//tensorflow/lite/experimental/litert/build_common:litert_build_defs.bzl", "export_lrt_runtime_only_linkopt", "export_lrt_runtime_only_script")
+load("//tensorflow/lite/experimental/litert/build_common:litert_build_defs.bzl", "copy_file", "export_lrt_runtime_only_linkopt", "export_lrt_runtime_only_script")
 load("//tensorflow/lite/experimental/litert/build_common:special_rule.bzl", "gles_deps", "gles_headers", "gles_linkopts")
 
 package(
@@ -165,6 +165,12 @@ cc_library(
 )
 
 cc_library(
+    name = "litert_tensor_buffer_types",
+    srcs = [],
+    hdrs = ["litert_tensor_buffer_types.h"],
+)
+
+cc_library(
     name = "litert_tensor_buffer",
     srcs = [
         "litert_tensor_buffer.cc",
@@ -185,6 +191,7 @@ cc_library(
         ":litert_event",
         ":litert_logging",
         ":litert_model",
+        ":litert_tensor_buffer_types",
         "//tensorflow/lite/experimental/litert/runtime:tensor_buffer",
         "@com_google_absl//absl/types:span",
         "@opencl_headers",
@@ -232,7 +239,6 @@ cc_library(
         "litert_dispatch_delegate.h",
     ],
     deps = [
-        ":litert_environment",
         "//tensorflow/lite/c:c_api",
         "//tensorflow/lite/c:c_api_opaque",
         "//tensorflow/lite/c:c_api_types",
@@ -475,6 +481,7 @@ cc_library(
         ":litert_options.h",
         ":litert_tensor_buffer.h",
         ":litert_tensor_buffer_requirements.h",
+        ":litert_tensor_buffer_types.h",
         # Needed for litert/c/litert_op_code.h
         "//tensorflow/lite:builtin_ops.h",
         # Neeeded for litert/c/litert_model.h
@@ -484,6 +491,12 @@ cc_library(
     deps = [
         "@opencl_headers",
     ],
+)
+
+copy_file(
+    name = "copy_litert_runtime_c_api_so",
+    src = "//tensorflow/lite/experimental/litert/c:litert_runtime_c_api_so",
+    target = "libLiteRtRuntimeCApi.so",
 )
 
 # This is cc_library target based on `libLiteRtRuntimeCApi.so`.
