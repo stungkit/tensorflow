@@ -144,8 +144,13 @@ class StreamExecutorGpuClient : public xla::PjRtStreamExecutorClient {
       absl::string_view serialized, std::optional<CompileOptions> options,
       const LoadOptions& load_options);
 
-  absl::StatusOr<std::unique_ptr<PjRtLoadedExecutable>> Compile(
+  absl::StatusOr<std::unique_ptr<PjRtLoadedExecutable>> CompileAndLoad(
       const XlaComputation& computation, CompileOptions options) override;
+
+  absl::StatusOr<PjRtStreamExecutorExecutionOutput> RunAsync(
+      LocalExecutable& exec, PjRtDevice* device,
+      std::vector<ShapeTree<PjRtStreamExecutorExecutionInput>> arguments,
+      ExecutableRunOptions run_options) override;
 
  private:
   xla::StreamExecutorGpuTopologyDescription topology_;

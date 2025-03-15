@@ -156,6 +156,7 @@ cc_library(
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:str_format",
         "@com_google_absl//absl/time",
+        "@com_google_absl//absl/types:span",
         "@eigen_archive//:eigen3",
         "@local_tsl//tsl/platform",
         "@local_tsl//tsl/platform:blocking_counter",
@@ -557,20 +558,29 @@ bzl_library(
     # "manual",
     # "notap",
     # ],
+    # visibility = internal_visibility(["//tensorflow:__subpackages__"]),
     # copybara:uncomment_end
-    visibility = internal_visibility(["//tensorflow:__subpackages__"]),
+    deps = [
+        "//xla/tsl:package_groups_bzl",
+    ],
 )
 
 bzl_library(
     name = "rules_cc_bzl",
     srcs = ["rules_cc.bzl"],
+    # This .bzl file is only used in OSS and references OSS paths. Therefore it cannot be parsed
+    # correctly by the parse test in g3.
+    # copybara:uncomment parse_tests = False,
 )
 
 bzl_library(
     name = "build_config_root_bzl",
     srcs = ["build_config_root.bzl"],
     # copybara:uncomment parse_tests = False,
-    deps = ["@local_tsl//third_party/py/rules_pywrap:pywrap_bzl"],
+    deps = [
+        "//xla/tsl:package_groups_bzl",
+        "@local_xla//third_party/py/rules_pywrap:pywrap_bzl",
+    ],
 )
 
 bzl_library(
@@ -580,7 +590,7 @@ bzl_library(
     deps = [
         ":build_config_root_bzl",
         "//xla/tsl:tsl_bzl",
-        "@local_tsl//third_party/py/rules_pywrap:pywrap_bzl",
+        "@local_xla//third_party/py/rules_pywrap:pywrap_bzl",
     ],
 )
 

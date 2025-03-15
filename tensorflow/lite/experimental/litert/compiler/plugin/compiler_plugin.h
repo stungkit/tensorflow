@@ -31,6 +31,7 @@
 #include "tensorflow/lite/experimental/litert/cc/litert_buffer_ref.h"
 #include "tensorflow/lite/experimental/litert/cc/litert_expected.h"
 #include "tensorflow/lite/experimental/litert/cc/litert_model.h"
+#include "tensorflow/lite/experimental/litert/cc/litert_shared_library.h"
 #include "tensorflow/lite/experimental/litert/compiler/plugin/compiler_flags.h"
 #include "tensorflow/lite/experimental/litert/core/model/model.h"
 #include "tensorflow/lite/experimental/litert/vendors/c/litert_compiler_plugin.h"
@@ -114,7 +115,7 @@ class CompilerPlugin {
   // Search for shared library files with prefix "libLiteRtCompilerPlugin" in
   // the directories passed through "lib_search_paths". Populates
   // "loaded_plugins" with resolved plugin apis for each found library that can
-  // be succesfully loaded. Additionally initializes the compiler plugin
+  // be successfully loaded. Additionally initializes the compiler plugin
   // instances and stores handle.
   static Expected<std::vector<CompilerPlugin>> LoadPlugins(
       absl::Span<const absl::string_view> lib_search_paths);
@@ -138,7 +139,7 @@ class CompilerPlugin {
   CompilerPlugin() = default;
 
   std::vector<std::string> soc_models_;
-  void* lib_handle_ = nullptr;
+  SharedLibrary lib_;
   LiteRtCompilerPluginApi plugin_api_ = {};
   LiteRtCompilerPlugin plugin_handle_ = nullptr;
 
@@ -162,7 +163,7 @@ Expected<PartitionResult> PartitionModel(CompilerPlugin& compiler_plugin,
 
 // Same as "PartitionModel" choose partitions directly based on the selected
 // ops. Selected ops may contain any ops in the the main subgraph of the model.
-// This function will seperate them into DAGs and slice the model accordingly.
+// This function will separate them into DAGs and slice the model accordingly.
 Expected<PartitionResult> PartitionModelDirect(
     std::vector<LiteRtOpWithPartitionIndex> selected_ops, LiteRtModelT& model);
 
@@ -171,7 +172,7 @@ Expected<PartitionResult> PartitionModelDirect(
 Expected<void> ApplyPlugin(CompilerPlugin& compiler_plugin, LiteRtModelT& model,
                            absl::string_view soc_model = "");
 
-// Applies the compilation step to the model given a pre-determined partition.
+// Applies the compilation step to the model given a predetermined partition.
 Expected<void> ApplyPluginWithPartition(CompilerPlugin& compiler_plugin,
                                         LiteRtModelT& model,
                                         PartitionResult partitions,
@@ -193,25 +194,6 @@ struct ApplyPluginsResult {
 Expected<ApplyPluginsResult> ApplyPlugins(
     LiteRtEnvironment environment, LiteRtModel model,
     LiteRtHwAcceleratorSet selected_hw_accelerators);
-
-// Composite Op util.
-
-// List of composite op names that are ignored during partitioning.
-// clang-format off
-inline constexpr absl::string_view kIgnoredCompositeOpNames[] = {
-    "odml.rms_norm"
-};
-// clang-format on
-
-// Struct to hold LiteRt composite ops.
-struct CompositeInfo {
-  LiteRtOp composite_op;
-  std::string composite_name;
-  int decomposition_subgraph_index;
-};
-
-// Returns the composite info for the given op if it is a composite op.
-std::optional<CompositeInfo> GetCompositeInfo(const LiteRtOp& op);
 
 }  // namespace litert::internal
 

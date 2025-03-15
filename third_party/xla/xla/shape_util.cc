@@ -144,7 +144,7 @@ absl::StatusOr<Shape> MakeShapeWithLayoutInternal(
       pointer_primitive_type, element_size_in_bits, memory_space, split_configs,
       std::move(physical_shape));
   TF_RETURN_IF_ERROR(ShapeUtil::ValidateShape(shape));
-  return std::move(shape);
+  return shape;
 }
 
 template <typename T>
@@ -316,7 +316,7 @@ std::ostream& operator<<(std::ostream& out, const ShapeIndex& shape_index) {
                            static_cast<int>(element_type),
                            absl::StrJoin(dimensions, ","));
   }
-  return std::move(shape);
+  return shape;
 }
 
 /* static */ absl::StatusOr<Shape> ShapeUtil::MakeValidatedShape(
@@ -342,7 +342,7 @@ std::ostream& operator<<(std::ostream& out, const ShapeIndex& shape_index) {
           "Cannot mark a dynamic dimension at dim=%d as static", i);
     }
   }
-  return std::move(shape);
+  return shape;
 }
 
 /* static */ Shape ShapeUtil::MakeShapeWithDenseLayout(
@@ -415,8 +415,8 @@ std::ostream& operator<<(std::ostream& out, const ShapeIndex& shape_index) {
 /* static */ Shape
 ShapeUtil::MakeShapeWithDescendingLayoutAndSamePhysicalLayout(
     const Shape& shape) {
-  std::vector<int64_t> dims(shape.dimensions_size());
-  for (int i = 0; i < shape.dimensions_size(); ++i) {
+  std::vector<int64_t> dims(shape.rank());
+  for (int i = 0; i < shape.rank(); ++i) {
     int dim = i;
     if (shape.has_layout()) {
       dim = LayoutUtil::Major(shape.layout(), dim);
@@ -434,7 +434,7 @@ ShapeUtil::MakeShapeWithDescendingLayoutAndSamePhysicalLayout(
     new_shape.mutable_layout()->set_tail_padding_alignment_in_elements(
         shape.layout().tail_padding_alignment_in_elements());
   }
-  for (int i = 0; i < shape.dimensions_size(); ++i) {
+  for (int i = 0; i < shape.rank(); ++i) {
     int dim = i;
     if (shape.has_layout()) {
       dim = LayoutUtil::Major(shape.layout(), dim);
@@ -534,7 +534,7 @@ ShapeUtil::MakeShapeWithDescendingLayoutAndSamePhysicalLayout(
 
 // Prepend new major-most dimension sized `bound` to the shape.
 Shape ShapeUtil::PrependMajorDimension(int64_t bound, Shape shape) {
-  Shape new_shape(shape.element_type(), {}, {}, {});
+  Shape new_shape(shape.element_type(), {}, {});
   new_shape.add_dimensions(bound);
   for (const int64_t dim : shape.dimensions()) {
     new_shape.add_dimensions(dim);
@@ -581,7 +581,7 @@ Shape ShapeUtil::PrependMajorDimension(int64_t bound, Shape shape) {
   // If not, and the most major dimension's size is 1, then we can repeat the
   // same check for next most major dimension as returned by
   // LayoutUtil::Major(1) and so on.
-  for (int64_t i = 0; i < shape.dimensions_size(); ++i) {
+  for (int64_t i = 0; i < shape.rank(); ++i) {
     int64_t major_dimension = LayoutUtil::Major(shape.layout(), i);
     if (major_dimension == dimension) {
       return true;
@@ -729,7 +729,7 @@ Shape ShapeUtil::PrependMajorDimension(int64_t bound, Shape shape) {
     }
   };
   print_one(0);
-  for (int i = 1, n = shape.dimensions_size(); i < n; ++i) {
+  for (int i = 1, n = shape.rank(); i < n; ++i) {
     printer->Append(",");
     print_one(i);
   }
@@ -848,8 +848,8 @@ Shape ShapeUtil::PrependMajorDimension(int64_t bound, Shape shape) {
 /* static */ DimensionVector ShapeUtil::CreateDimensionVectorFromShape(
     const Shape& shape) {
   DimensionVector dimensions;
-  dimensions.reserve(shape.dimensions_size());
-  for (int i = 0; i < shape.dimensions_size(); ++i) {
+  dimensions.reserve(shape.rank());
+  for (int i = 0; i < shape.rank(); ++i) {
     dimensions.push_back(shape.dimensions(i));
   }
   return dimensions;
@@ -1010,7 +1010,7 @@ absl::Status ValidateNonLayoutProperties(const Shape& shape) {
     return ShapeError(shape, "Invalid element type.");
   }
   if (shape.element_type() == TUPLE) {
-    if (shape.dimensions_size() != 0) {
+    if (shape.rank() != 0) {
       return ShapeError(shape, "This type cannot have dimensions.");
     }
     for (auto& element_shape : shape.tuple_shapes()) {
@@ -1026,7 +1026,7 @@ absl::Status ValidateNonLayoutProperties(const Shape& shape) {
 
   // Tokens and opaques should not have layout or dimensions.
   if (shape.element_type() == TOKEN || shape.element_type() == OPAQUE_TYPE) {
-    if (shape.dimensions_size() != 0) {
+    if (shape.rank() != 0) {
       return ShapeError(shape, "This type cannot have dimensions.");
     }
     if (shape.has_layout()) {
@@ -1767,8 +1767,7 @@ ShapeUtil::DecomposeBitcastToTrt(const Shape& input_shape,
   Shape new_shape(shape.element_type(),
                   Permute(shape.dimensions(), permutation),
                   absl::InlinedVector<bool, 8>(dynamic_dimensions.begin(),
-                                               dynamic_dimensions.end()),
-                  {});
+                                               dynamic_dimensions.end()));
   if (shape.has_layout()) {
     *new_shape.mutable_layout() = shape.layout();
     for (int64_t& dim : *new_shape.mutable_layout()->mutable_minor_to_major()) {
@@ -1877,8 +1876,8 @@ ShapeUtil::DecomposeBitcastToTrt(const Shape& input_shape,
 /* static */ absl::Status ShapeUtil::ForEachIndexParallelWithStatus(
     const Shape& shape,
     const ForEachParallelVisitorFunction& visitor_function) {
-  std::vector<int64_t> base(shape.dimensions_size());
-  std::vector<int64_t> incr(shape.dimensions_size(), 1);
+  std::vector<int64_t> base(shape.rank());
+  std::vector<int64_t> incr(shape.rank(), 1);
   return ForEachIndexParallelWithStatus(shape, base,
                                         /*count=*/shape.dimensions(), incr,
                                         visitor_function);
@@ -1932,7 +1931,7 @@ ShapeUtil::DecomposeBitcastToTrt(const Shape& input_shape,
 namespace {
 
 struct ParallelState {
-  explicit ParallelState(int64_t task_count) : counter(task_count) {
+  explicit ParallelState(int64_t task_count) {
     // If this method is changed, please remember to change
     // GetForEachIndexParallelThreadCount() as well.
     static auto* global_pool = new tsl::thread::ThreadPool(
@@ -1940,13 +1939,10 @@ struct ParallelState {
     pool = global_pool;
   }
   ~ParallelState() = default;
-  void Wait() { counter.Wait(); }
-  void TaskComplete() { counter.DecrementCount(); }
 
   absl::Mutex mu;
   tsl::thread::ThreadPool* pool;
   absl::Status status;  // Guarded by mu
-  absl::BlockingCounter counter;
 };
 
 }  // anonymous namespace
@@ -1973,9 +1969,14 @@ struct ParallelState {
     return execute_inline();
   }
 
+  // Don't try to handle scalar shapes in parallel.
+  if (ElementsIn(shape) == 1) {
+    return execute_inline();
+  }
+
   // Compute the dimensions of the "work" which are defined by the count of
   // elements in each dimension and the increment.
-  std::vector<int64_t> work_dims(shape.dimensions_size());
+  std::vector<int64_t> work_dims(shape.rank());
   for (size_t d = 0; d < shape.rank(); ++d) {
     work_dims[d] = tsl::MathUtil::CeilOfRatio(count[d], incr[d]);
   }
@@ -1999,7 +2000,8 @@ struct ParallelState {
   ShapePartitionIterator iterator(work_shape, partition_counts);
   ParallelState pstate(partition_count);
 
-  for (size_t i = 0; i < partition_count; ++i) {
+  // Process a single partition using bounds defined by the partition iterator.
+  auto process_partition = [&](size_t i) {
     auto partition = iterator.GetPartition(i);
 
     // Adjust base and count for the `i`-th partition.
@@ -2018,31 +2020,32 @@ struct ParallelState {
                                       partition_size * incr[dim]);
     }
 
-    pstate.pool->Schedule([&, base = std::move(partition_base),
-                           count = std::move(partition_count)] {
-      ForEachState s(shape, base, count, incr);
-      const int thread_id = pstate.pool->CurrentThreadId();
+    ForEachState s(shape, partition_base, partition_count, incr);
+    const int thread_id = pstate.pool->CurrentThreadId();
 
-      // Allows handling R0 arrays, such that the visitor function will be
-      // called once with the proper empty indexes.
-      int64_t n = -1;
-      while (n < s.rank) {
-        absl::StatusOr<bool> result = visitor_function(s.indexes, thread_id);
-        if (!result.ok()) {
-          absl::MutexLock lock(&pstate.mu);
-          if (pstate.status.ok()) {
-            pstate.status = result.status();
-          }
+    // Allows handling R0 arrays, such that the visitor function will be
+    // called once with the proper empty indexes.
+    int64_t n = -1;
+    while (n < s.rank) {
+      absl::StatusOr<bool> result = visitor_function(s.indexes, thread_id);
+      if (!result.ok()) {
+        absl::MutexLock lock(&pstate.mu);
+        if (pstate.status.ok()) {
+          pstate.status = result.status();
         }
-        // Increments dimensions in minor to major order.
-        n = s.IncrementDim();
       }
+      // Increments dimensions in minor to major order.
+      n = s.IncrementDim();
+    }
+  };
 
-      pstate.TaskComplete();
-    });
-  }
-
-  pstate.Wait();
+  // Launch parallel for loop to process all partitions.
+  pstate.pool->ParallelFor(partition_count, /*cost_per_unit=*/1000000,
+                           [&](int64_t p_begin, int64_t p_end) {
+                             for (size_t i = p_begin; i < p_end; ++i) {
+                               process_partition(i);
+                             }
+                           });
   return pstate.status;
 }
 
@@ -2097,7 +2100,7 @@ absl::Status ShapeUtil::ByteStrides(const Shape& shape,
                                     absl::Span<int64_t> strides) {
   TF_RET_CHECK(shape.IsArray());
   TF_RET_CHECK(shape.has_layout());
-  TF_RET_CHECK(shape.dimensions_size() == strides.size());
+  TF_RET_CHECK(shape.rank() == strides.size());
 
   int64_t stride = ByteSizeOfPrimitiveType(shape.element_type());
   for (int i : shape.layout().minor_to_major()) {
@@ -2110,7 +2113,7 @@ absl::Status ShapeUtil::ByteStrides(const Shape& shape,
 /*static*/
 std::optional<absl::InlinedVector<int64_t, 4>> ShapeUtil::ByteStrides(
     const Shape& shape) {
-  absl::InlinedVector<int64_t, 4> strides(shape.dimensions_size());
+  absl::InlinedVector<int64_t, 4> strides(shape.rank());
   if (!ByteStrides(shape, absl::MakeSpan(strides)).ok()) {
     return std::nullopt;
   }
