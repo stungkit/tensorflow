@@ -13,11 +13,21 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#ifndef XLA_PJRT_COMPILE_OPTIONS_PB_H_
-#define XLA_PJRT_COMPILE_OPTIONS_PB_H_
+#ifndef XLA_HLO_TOOLS_HLO_DIFF_GRAPH_UTILS_CYCLE_DETECTOR_H_
+#define XLA_HLO_TOOLS_HLO_DIFF_GRAPH_UTILS_CYCLE_DETECTOR_H_
 
-// TODO(b/401293975): Delete this file and migrate Jax to use the proto target
-// directly.
-#include "xla/pjrt/proto/compile_options.pb.h"
+#include <vector>
 
-#endif  // XLA_PJRT_COMPILE_OPTIONS_PB_H_
+#include "xla/hlo/tools/hlo_diff/graph/hlo_gumgraph_node.h"
+
+namespace xla {
+namespace hlo_diff {
+
+// Detects and logs all cycles in the provided graph.
+std::vector<std::vector<const HloInstructionNode*>> DetectAndLogAllCycles(
+    const std::vector<HloInstructionNode*>& graph_nodes);
+
+}  // namespace hlo_diff
+}  // namespace xla
+
+#endif  // XLA_HLO_TOOLS_HLO_DIFF_GRAPH_UTILS_CYCLE_DETECTOR_H_
