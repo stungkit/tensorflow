@@ -59,6 +59,7 @@ limitations under the License.
 #include "llvm/Transforms/Scalar/EarlyCSE.h"
 #include "llvm/Transforms/Scalar/SCCP.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
+#include "xla/codegen/math/exp.h"
 #include "xla/codegen/math/ldexp.h"
 #include "xla/codegen/math/string_interner.h"
 #include "xla/codegen/math/vec_name_mangler.h"
@@ -88,12 +89,12 @@ void VisitFunctionCalls(llvm::Module& module,
 absl::flat_hash_map<absl::string_view, absl::flat_hash_set<PrimitiveType>>
 GetCalledApproximatableFunctions(
     llvm::Module& module,
-    absl::flat_hash_map<std::string, absl::string_view> target_to_approx) {
+    absl::flat_hash_map<absl::string_view, absl::string_view> targets) {
   absl::flat_hash_map<absl::string_view, absl::flat_hash_set<PrimitiveType>>
       called_targets;
   VisitFunctionCalls(module, [&](const llvm::CallInst& call) {
-    if (auto it = target_to_approx.find(call.getCalledFunction()->getName());
-        it != target_to_approx.end()) {
+    if (auto it = targets.find(call.getCalledFunction()->getName());
+        it != targets.end()) {
       called_targets[it->second].insert(
           llvm_ir::PrimitiveTypeFromIrType(call.getArgOperand(0)->getType()));
     }
@@ -141,15 +142,46 @@ class LdexpF64MathFunction final : public MathFunction {
   }
 };
 
+class ExpF64MathFunction final : public MathFunction {
+ public:
+  absl::string_view FunctionName() const override { return "exp"; }
+  std::vector<std::string> TargetFunctions() const override {
+    return {"xla.exp.f64"};
+  }
+  std::vector<VectorType> SupportedVectorTypes() const override {
+    return {
+        {xla::F64, 1},
+        {xla::F64, 2},
+        {xla::F64, 4},
+        {xla::F64, 8},
+    };
+  }
+
+  std::string GenerateVectorizedFunctionName(
+      VectorType vector_type) const override {
+    return math::ExpF64FunctionName(vector_type.width);
+  }
+
+  std::string GenerateMangledSimdName(VectorType vector_type) const override {
+    return math::GetMangledNamePrefix(/*is_masked=*/false, vector_type.width,
+                                      {math::VecParamCardinality::kVector});
+  }
+
+  llvm::Function* CreateDefinition(llvm::Module& module, absl::string_view name,
+                                   VectorType vector_type) const override {
+    llvm::Type* float_type =
+        llvm_ir::PrimitiveTypeToIrType(vector_type.dtype, module.getContext());
+    llvm::Type* vec_type = float_type;
+    if (vector_type.width > 1) {
+      vec_type = llvm::VectorType::get(float_type, vector_type.width, false);
+    }
+    return math::CreateExpF64(&module, vec_type);
+  }
+};
+
 MathFunctionLib::MathFunctionLib() {
   math_functions_.push_back(std::make_unique<LdexpF64MathFunction>());
-
-  for (const auto& math_approximation : math_functions_) {
-    for (const absl::string_view target_function :
-         math_approximation->TargetFunctions()) {
-      target_to_approx_[target_function] = math_approximation->FunctionName();
-    }
-  }
+  math_functions_.push_back(std::make_unique<ExpF64MathFunction>());
 }
 
 std::vector<llvm::VecDesc> MathFunctionLib::Vectorizations() {
@@ -159,16 +191,18 @@ std::vector<llvm::VecDesc> MathFunctionLib::Vectorizations() {
       absl::string_view target_function_interned =
           math::StringInterner::Get().Intern(target_function);
       for (const auto& vector_type : math_func->SupportedVectorTypes()) {
+        absl::string_view vec_name = math::StringInterner::Get().Intern(
+            math_func->GenerateVectorizedFunctionName(vector_type));
         llvm::VecDesc vec_desc = {
             target_function_interned,
-            math::StringInterner::Get().Intern(
-                math_func->GenerateVectorizedFunctionName(vector_type)),
+            vec_name,
             llvm::ElementCount::getFixed(vector_type.width),
             false,
             math::StringInterner::Get().Intern(
                 math_func->GenerateMangledSimdName(vector_type)),
             std::nullopt};
         vec_descs.push_back(vec_desc);
+        targets_[vec_name] = math_func->FunctionName();
       }
     }
   }
@@ -207,7 +241,7 @@ absl::flat_hash_set<absl::string_view> MathFunctionLib::RewriteMathFunctions(
   // llvm.compiler.used later.
   absl::flat_hash_set<absl::string_view> replaced_functions;
   for (const auto& [function_name, dtypes] :
-       GetCalledApproximatableFunctions(module, target_to_approx_)) {
+       GetCalledApproximatableFunctions(module, targets_)) {
     for (const auto& math_func : math_functions_) {
       if (math_func->FunctionName() == function_name) {
         for (const auto& vector_type : math_func->SupportedVectorTypes()) {

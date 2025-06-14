@@ -152,19 +152,6 @@ static llvm::PipelineTuningOptions GetPipelineTuningOptions(
     // TODO(b/411125413): Re-enable SLPVectorization once the LLVM bug is fixed.
     pto.SLPVectorization = false;
 
-    // TODO(b/419635451): Without AVX512 loop unrolling leads to LLVM generating
-    // enormous IR that later times out during code generation (AVX2 doesn't
-    // have masked SIMD instructions, and control flow ends up vectorizing to a
-    // lot of scalar loads and stores, which takes forever to codegen in machine
-    // instruction selection). As a workaround, disable loop unrolling when
-    // AVX512 is not available. Revisit this decision once we migrate to new
-    // fusion emitters that do not rely on LLVM that much.
-    auto target_features = target_machine->getTargetFeatureString();
-    if (target_features.contains("+avx2") &&
-        !target_features.contains("+avx512")) {
-      pto.LoopUnrolling = false;
-    }
-
     return pto;
   };
 
@@ -409,7 +396,7 @@ std::unique_ptr<llvm::MemoryBuffer> IrCompiler::EmitMachineCode(
   codegen_passes.run(module);
 
   return std::make_unique<llvm::SmallVectorMemoryBuffer>(
-      std::move(mc_stream_buffer));
+      std::move(mc_stream_buffer), module.getName());
 }
 
 llvm::CodeGenOptLevel IrCompiler::GetCodeGenOptLevel(

@@ -77,7 +77,8 @@ struct DmaCopyChunk {
 
 // Copies into subdivisions of scratch asyncly in parallel calling on_done
 // sequentially when the copy has finished.
-class PremappedCopierState {
+class PremappedCopierState
+    : public std::enable_shared_from_this<PremappedCopierState> {
  public:
   PremappedCopierState(std::shared_ptr<absl::Span<uint8_t>> scratch,
                        size_t max_num_parallel_copies, size_t xfer_size);
@@ -86,7 +87,9 @@ class PremappedCopierState {
     void* dest_buffer;
     size_t seq_id;
     bool is_ready;
-    absl::AnyInvocable<void(PremappedCopierState* state, void* buf,
+    absl::Status result_status;
+    absl::AnyInvocable<void(PremappedCopierState* state,
+                            absl::StatusOr<void*> buf,
                             const DmaCopyChunk& chunk) &&>
         on_done;
   };
@@ -94,11 +97,11 @@ class PremappedCopierState {
   // on_done callback must schedule a call to ReturnBuffer at some point in the
   // future. Since on_done can be called from the TPU thread, avoid doing any
   // serious work (or even calling ReturnBuffer).
-  void ScheduleCopy(
-      DmaCopyChunk blob,
-      absl::AnyInvocable<void(PremappedCopierState* state, void* buf,
-                              const DmaCopyChunk& chunk) &&>
-          on_done);
+  void ScheduleCopy(DmaCopyChunk blob,
+                    absl::AnyInvocable<void(PremappedCopierState* state,
+                                            absl::StatusOr<void*> buf,
+                                            const DmaCopyChunk& chunk) &&>
+                        on_done);
 
   // Allows buffer to be reused.
   void ReturnBuffer(void* buffer);
@@ -152,6 +155,7 @@ class PjRtBufferEntry : public PullTable::Entry {
   struct BufferRef {
     std::shared_ptr<xla::PjRtBuffer> buffer;
     size_t buf_size;
+    xla::PjRtFuture<> ready_future;
   };
   explicit PjRtBufferEntry(std::vector<BufferRef> arrs,
                            std::shared_ptr<PremappedCopierState> state,

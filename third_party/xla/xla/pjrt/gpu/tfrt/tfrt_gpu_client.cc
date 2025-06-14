@@ -386,33 +386,30 @@ class TfrtGpuAsyncHostToDeviceTransferManager final
       absl::InlinedVector<tsl::AsyncValueRef<GpuEvent>, 4> definition_events,
       absl::InlinedVector<Shape, 4> device_shapes, TfrtGpuDevice* device)
       : buffers_(std::move(buffers)),
-        h2d_thread_(std::make_unique<WorkerThread>(
-            tsl::Env::Default(),
-            "TfrtGpuAsyncHostToDeviceTransferManager_h2d_thread")),
         buffer_ptrs_(std::move(buffer_ptrs)),
         buffer_sizes_(GetBufferSizes(buffers_)),
         definition_events_(std::move(definition_events)),
         device_shapes_(std::move(device_shapes)),
-        remaining_buffer_count_(buffers_.size()),
         device_(device),
         client_(tsl::down_cast<TfrtGpuClient*>(device_->client())) {
     VLOG(3) << "TfrtGpuAsyncHostToDeviceTransferManager::"
                "TfrtGpuAsyncHostToDeviceTransferManager: this="
             << this << " buffers_.size()=" << buffers_.size();
-
+    transfers_in_flight_.resize(buffer_ptrs_.size(), 0);
     last_transfer_started_.resize(buffer_ptrs_.size(), false);
   }
 
   ~TfrtGpuAsyncHostToDeviceTransferManager() override {
-    auto transfers_finished = [this]() {
-      mu_.AssertHeld();
-      return transfers_in_flight_ == 0;
-    };
-    {
+    for (int buffer_index = 0; buffer_index < transfers_in_flight_.size();
+         buffer_index++) {
       absl::MutexLock l(&mu_);
       // Make sure we don't leave dangling pointers in cleanup routines even
       // if the client lets the object go out of scope.
-      mu_.Await(absl::Condition(&transfers_finished));
+      mu_.Await(absl::Condition(
+          +[](size_t* transfers_in_flight) {
+            return *transfers_in_flight == 0;
+          },
+          &transfers_in_flight_[buffer_index]));
     }
   }
 
@@ -460,7 +457,7 @@ class TfrtGpuAsyncHostToDeviceTransferManager final
       buffer = buffer_ptrs_[buffer_index];
       DCHECK(buffer);
 
-      ++transfers_in_flight_;
+      ++transfers_in_flight_[buffer_index];
     }
 
     // The host to device transfer is performed on a thread pool, mostly
@@ -498,10 +495,10 @@ class TfrtGpuAsyncHostToDeviceTransferManager final
 
       CHECK_OK(status) << "Failed to block host until done";
 
-      CleanUp(buffer_index, true, std::move(on_done));
+      CleanUp(buffer_index, std::move(on_done));
     };
     // Enqueue the transfer to the h2d thread.
-    h2d_thread_->Schedule(std::move(transfer_h2d));
+    EnqueueWork(client_->blocking_thread_pool(), std::move(transfer_h2d));
     return absl::OkStatus();
   }
 
@@ -564,7 +561,7 @@ class TfrtGpuAsyncHostToDeviceTransferManager final
         sub_buffer = buffer_memory->buffer();
       }
 
-      ++transfers_in_flight_;
+      ++transfers_in_flight_[buffer_index];
     }
 
     auto copy_to_gpu = [transfer_size,
@@ -608,10 +605,13 @@ class TfrtGpuAsyncHostToDeviceTransferManager final
         VLOG(3) << "H2D copy done: " << status;
         CHECK_OK(status) << "Failed to block host until done";
       }
-      CleanUp(buffer_index, is_last_transfer, std::move(on_done));
+      CleanUp(buffer_index, std::move(on_done));
     };
     // Enqueue the transfer to the h2d thread.
-    h2d_thread_->Schedule(std::move(copy_to_gpu));
+    // Note: The ordering of transfers enqueued via this method is not
+    // guaranteed.  If multiple transfers for the same buffer are submitted,
+    // their execution order may vary.
+    EnqueueWork(client_->blocking_thread_pool(), std::move(copy_to_gpu));
     return absl::OkStatus();
   }
 
@@ -640,37 +640,39 @@ class TfrtGpuAsyncHostToDeviceTransferManager final
     return buffer_sizes;
   }
 
-  void CleanUp(int buffer_index, bool is_last_transfer,
-               absl::AnyInvocable<void() &&> on_done) {
+  void CleanUp(int buffer_index, absl::AnyInvocable<void() &&> on_done) {
+    TfrtGpuClient* client = client_;
     {
       tsl::profiler::TraceMe traceme(
           "TfrtGpuAsyncHostToDeviceTransferManager::CleanUp");
 
       absl::MutexLock l(&mu_);
 
-      CHECK_GT(transfers_in_flight_, 0);
-      --transfers_in_flight_;
+      bool last_transfer_started = last_transfer_started_[buffer_index];
+      size_t transfers_in_flight = transfers_in_flight_[buffer_index];
       VLOG(3) << "CleanUp for buffer_index=" << buffer_index
-              << " is_last_transfer=" << is_last_transfer
-              << " remaining_buffer_count_=" << remaining_buffer_count_
+              << " last_transfer_started_=" << last_transfer_started
+              << " transfers_in_flight_=" << transfers_in_flight
               << "; this: " << this;
 
-      if (is_last_transfer) {
+      bool is_last_transfer_for_buffer =
+          last_transfer_started && transfers_in_flight == 1;
+      if (is_last_transfer_for_buffer) {
         // Drop our reference to the TrackedDeviceBuffer for this buffer.
         CHECK(buffer_ptrs_[buffer_index]);
         buffer_ptrs_[buffer_index] = nullptr;
-        CHECK_GT(remaining_buffer_count_, 0);
-        --remaining_buffer_count_;
         definition_events_[buffer_index].SetStateConcrete();
-        if (remaining_buffer_count_ == 0) {
-          VLOG(3) << "TransferLiteralToBuffer for all buffers is done. this: "
-                  << this;
-        }
       }
+      CHECK_GT(transfers_in_flight_[buffer_index], 0);
+      --transfers_in_flight_[buffer_index];
     }
 
     // Call on_done after finishing all housekeeping and releasing the lock.
-    EnqueueWork(client_->non_blocking_thread_pool(), std::move(on_done));
+    // Note: Use a copy of `client_` because accessing `this->client_` directly
+    // here is unsafe, as the manager instance could be destroyed after
+    // `transfers_in_flight_` is decremented and the mutex released,
+    // invalidating member access.
+    EnqueueWork(client->non_blocking_thread_pool(), std::move(on_done));
   }
 
   absl::Mutex mu_;
@@ -678,12 +680,6 @@ class TfrtGpuAsyncHostToDeviceTransferManager final
   // Retrieve.
   absl::InlinedVector<std::unique_ptr<PjRtBuffer>, 4> buffers_
       ABSL_GUARDED_BY(mu_);
-
-  // Just a single thread, to ensure transfers are ordered. Its lifetime is
-  // managed by H2DTransferManager. We assume `h2d_thread` is destructed before
-  // `client_`, so `on_done` callbacks on `h2d_thread` will be handled by
-  // threads managed by `client_`.
-  std::unique_ptr<WorkerThread> h2d_thread_;
 
   absl::InlinedVector<tsl::AsyncValueRef<GpuDeviceMemory>, 4> buffer_ptrs_
       ABSL_GUARDED_BY(mu_);
@@ -700,12 +696,10 @@ class TfrtGpuAsyncHostToDeviceTransferManager final
       ABSL_GUARDED_BY(mu_);
   // Device shapes for all buffers with either compact or custom layout.
   const absl::InlinedVector<Shape, 4> device_shapes_;
-  // Count of buffers that have not yet been fully transferred.
-  size_t remaining_buffer_count_ ABSL_GUARDED_BY(mu_);
   // Count of transfers that have been started but have not yet called
   // cleanup. Used to block in the destructor to avoid dangling pointers in
   // cleanup.
-  int transfers_in_flight_ ABSL_GUARDED_BY(mu_) = 0;
+  absl::InlinedVector<size_t, 4> transfers_in_flight_ ABSL_GUARDED_BY(mu_);
 
   TfrtGpuDevice* const device_;  // not owned.
   TfrtGpuClient* const client_;  // not owned.
@@ -2171,40 +2165,39 @@ TfrtGpuClient::BufferFromHostLiteral(const LiteralSlice& literal,
   // It is OK to capture `buffer` pointer because the `output_buffer` can't
   // be deleted until all the usage holds have gone away.
   VLOG(4) << "BufferFromHostLiteral for device_buffer: " << device_buffer;
-  EnqueueWork(non_blocking_thread_pool_.get(),
-              [literal, av = avs[0], device_buffer, shape, this,
-               device = tsl::down_cast<TfrtGpuDevice*>(device),
-               usage_event = std::move(usage_event)]() mutable {
-                tsl::profiler::TraceMe traceme(
-                    "BufferFromHostLiteral::H2D_Dispatch");
-                TransferManager* transfer_manager =
-                    xla_client()->backend().transfer_manager();
+  EnqueueWork(
+      non_blocking_thread_pool_.get(),
+      [literal, av = avs[0], device_buffer, shape, this,
+       device = tsl::down_cast<TfrtGpuDevice*>(device),
+       usage_event = std::move(usage_event)]() mutable {
+        tsl::profiler::TraceMe traceme("BufferFromHostLiteral::H2D_Dispatch");
+        TransferManager* transfer_manager =
+            xla_client()->backend().transfer_manager();
 
-                auto stream = device->stream();
+        auto stream = device->stream();
 
-                const auto& buffer = device_buffer->buffer();
-                if (literal.shape().IsArray()) {
-                  CHECK_EQ(literal.size_bytes(), buffer->size_bytes());
-                }
+        const auto& buffer = device_buffer->buffer();
+        if (literal.shape().IsArray()) {
+          CHECK_EQ(literal.size_bytes(), buffer->size_bytes());
+        }
 
-                ShapedBuffer shaped_buffer =
-                    buffer->AsShapedBuffer(shape, device);
+        ShapedBuffer shaped_buffer = buffer->AsShapedBuffer(shape, device);
 
-                TF_CHECK_OK(transfer_manager->TransferLiteralToDeviceAsync(
-                    stream, literal, shaped_buffer));
+        TF_CHECK_OK(transfer_manager->TransferLiteralToDeviceAsync(
+            stream, literal, shaped_buffer));
 
-                absl::Status status;
-                {
-                  tsl::profiler::TraceMe traceme("BlockHostUntilDone");
-                  status = stream->BlockHostUntilDone();
-                }
-                CHECK_OK(status) << "Failed to block host until done";
-                VLOG(3) << "BufferFromHostLiteral done for device_buffer: "
-                        << device_buffer << " AsyncValue: " << av.get();
+        absl::Status status;
+        {
+          tsl::profiler::TraceMe traceme("BlockHostUntilDone");
+          status = stream->BlockHostUntilDone();
+        }
+        CHECK_OK(status) << "Failed to block host until done";
+        VLOG(3) << "BufferFromHostLiteral done for device_buffer: "
+                << device_buffer << " AsyncValue: " << av.get();
 
-                av->SetStateConcrete();
-                usage_event.SetStateConcrete();
-              });
+        av->SetStateConcrete();
+        usage_event.SetStateConcrete();
+      });
   return std::unique_ptr<PjRtBuffer>(std::move(output_buffer));
 }
 
@@ -2865,11 +2858,9 @@ PjRtFuture<> TfrtGpuBuffer::ToLiteral(MutableLiteralBase* literal) {
 
     HostMemoryAllocator::OwnedPtr staging_buffer;
     void* buffer_ptr;
-    if (should_unpack || transpose != nullptr) {
+    if (on_device_shape.IsArray()) {
       staging_buffer = client->host_memory_allocator()->Allocate(byte_size);
       buffer_ptr = staging_buffer.get();
-    } else if (on_device_shape.IsArray()) {
-      buffer_ptr = literal->untyped_data();
     } else {
       CHECK_EQ(byte_size, 0);
       buffer_ptr = nullptr;
@@ -2929,6 +2920,9 @@ PjRtFuture<> TfrtGpuBuffer::ToLiteral(MutableLiteralBase* literal) {
       if (should_unpack) {
         tsl::port::AlignedFree(buffer);
       }
+    }
+    if (on_device_shape.IsArray() && !should_unpack && transpose == nullptr) {
+      std::memcpy(literal->untyped_data(), buffer, byte_size);
     }
     promise.Set(absl::OkStatus());
   };
@@ -3413,10 +3407,6 @@ TfrtGpuExecutable::TfrtGpuExecutable(
 absl::StatusOr<PjRtLoadedExecutable::Result> TfrtGpuExecutable::ExecuteHelper(
     absl::Span<PjRtBuffer* const> argument_handles, int replica, int partition,
     const ExecuteOptions& options, bool fill_future, TfrtGpuDevice* device) {
-  tsl::profiler::TraceMeProducer activity("TfrtGpuExecutable::ExecuteHelper",
-                                          tsl::profiler::ContextType::kPjRt,
-                                          options.launch_id);
-
   std::shared_ptr<DeviceAssignment> device_assignment;
   if (device == nullptr) {
     CHECK(device_assignment_ != nullptr);
@@ -3435,6 +3425,15 @@ absl::StatusOr<PjRtLoadedExecutable::Result> TfrtGpuExecutable::ExecuteHelper(
     (*device_assignment)(0, 0) = device->id();
   }
   CHECK_EQ(device->process_index(), client_->process_index());
+
+  tsl::profiler::TraceMeProducer activity(
+      [&] {
+        return tsl::profiler::TraceMeEncode("TfrtGpuExecutable::ExecuteHelper",
+                                            {{"launch_id", options.launch_id},
+                                             {"device_id", device->id()},
+                                             {"name", name()}});
+      },
+      tsl::profiler::ContextType::kPjRt, options.launch_id);
 
   VLOG(1) << "ExecuteHelper " << name() << ": " << options.launch_id
           << "; replica: " << replica << "; partition: " << partition
@@ -3689,15 +3688,15 @@ absl::StatusOr<PjRtLoadedExecutable::Result> TfrtGpuExecutable::ExecuteHelper(
                 << ", launch_id: " << launch_id << ", replica: " << replica
                 << ", device: " << device->DebugString();
 
-        tsl::profiler::TraceMeProducer producer(
+        tsl::profiler::TraceMeConsumer producer(
             [&] {
               return tsl::profiler::TraceMeEncode(
                   "execute_fn", {
-                                    {"launch_id", std::to_string(launch_id)},
+                                    {"launch_id", launch_id},
                                     {"device_id", device->id()},
                                 });
             },
-            tsl::profiler::ContextType::kTfExecutor, launch_id);
+            tsl::profiler::ContextType::kPjRt, launch_id);
 
         auto set_error = [&](absl::Status status) {
           for (auto& output_buffer : output_buffers) {
@@ -3862,7 +3861,14 @@ absl::StatusOr<PjRtLoadedExecutable::Result> TfrtGpuExecutable::ExecuteHelper(
        input_buffer_sizes_in_bytes(
            input_buffer_sizes_in_bytes_[executable_idx])]() mutable {
         tsl::profiler::TraceMeConsumer activity(
-            "prepare_inputs", tsl::profiler::ContextType::kPjRt, launch_id);
+            [&] {
+              return tsl::profiler::TraceMeEncode(
+                  "prepare_inputs", {
+                                        {"launch_id", launch_id},
+                                        {"device_id", device->id()},
+                                    });
+            },
+            tsl::profiler::ContextType::kPjRt, launch_id);
 
         auto set_error = [&](absl::Status status) {
           complete_event.SetError(status);
